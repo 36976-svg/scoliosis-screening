@@ -1,4 +1,6 @@
-opencv-python-headless==4.8.1.78
-mediapipe==0.10.14
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
 streamlit
-numpy<2
+opencv-python-headless
+numpy
+spinepose
