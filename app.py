@@ -276,12 +276,13 @@ def measure_zone_brightness(image_bgr, annotated, y_top, y_bottom, x_center, w,
     return diff, side
 
 
-def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w):
+def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w,
+                        edge_margin_frac=0.12):
     """หาจุดที่สะบักนูนที่สุดของแต่ละฝั่ง 'แยกกันอิสระ' โดยลบแนวโน้มการไล่แสง
-    (ผิวหลังสว่างไล่ระดับจากไหล่ลงเอวตามธรรมชาติ ถ้าหาแค่ 'แถวที่สว่างที่สุด' เฉยๆ
-    จะไปเกาะที่ขอบบนสุดเสมอ ไม่ใช่ตัวสะบักจริง) จึงต้อง detrend ก่อน:
-    ลบค่าเฉลี่ยเคลื่อนที่แบบ smooth ออกจากสัญญาณ เหลือแต่ส่วนที่ 'นูนกว่าแนวโน้มรอบข้าง'
-    แล้วหาจุดสูงสุดของส่วนที่เหลือนั้นแทน ได้ 2 สัญญาณ:
+    (ผิวหลังสว่างไล่ระดับจากไหล่ลงเอวตามธรรมชาติ) ด้วยวิธี linear detrend
+    (fit เส้นตรงเข้ากับสัญญาณความสว่างแล้วลบออก) ซึ่งไม่มีปัญหา edge bias
+    แบบ moving-average ที่เคยลองมาก่อน แล้วตัดขอบบน-ล่างออกจากการค้นหาจุดพีค
+    (กันจุดหลอกที่ขอบ) เหลือแต่ส่วนที่ 'นูนกว่าแนวโน้มรอบข้าง' จริงๆ ได้ 2 สัญญาณ:
     - ตำแหน่งสูง/ต่ำของสะบักแต่ละข้าง (บางคนสะบักข้างหนึ่งอยู่สูงกว่าอีกข้างจริง)
     - ระดับความนูนของแต่ละข้าง (จากขนาดของตุ่มที่เหลือหลัง detrend)
     คืนค่า dict ของผล หรือ None ถ้าโซนเล็กเกินไป"""
@@ -300,14 +301,15 @@ def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w):
     def detrended_peak(profile_2d):
         profile = profile_2d.mean(axis=1)  # ความสว่างเฉลี่ยต่อแถว
         n = len(profile)
-        win = max(5, int(n * 0.6))  # หน้าต่าง smooth กว้าง ~60% ของโซน เพื่อจับแนวโน้มไล่แสงรวม
-        if win % 2 == 0:
-            win += 1
-        kernel = np.ones(win) / win
-        padded = np.pad(profile, (win // 2, win // 2), mode='edge')
-        trend = np.convolve(padded, kernel, mode='valid')[:n]
+        x = np.arange(n)
+        coeffs = np.polyfit(x, profile, deg=1)  # fit เส้นตรง = แนวโน้มการไล่แสงรวม
+        trend = np.polyval(coeffs, x)
         detail = profile - trend  # ส่วนที่ 'นูนกว่าแนวโน้มรอบข้าง' หลังหักการไล่แสงออก
-        peak_row = int(np.argmax(detail))
+        margin = max(1, int(n * edge_margin_frac))
+        if n - 2 * margin < 3:
+            margin = 0
+        search = detail[margin:n - margin] if margin > 0 else detail
+        peak_row = int(np.argmax(search)) + margin
         return peak_row, float(profile[peak_row])
 
     left_peak_row,  left_peak_val  = detrended_peak(left_gray)
