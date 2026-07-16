@@ -277,33 +277,44 @@ def measure_zone_brightness(image_bgr, annotated, y_top, y_bottom, x_center, w,
 
 
 def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w):
-    """หาจุดที่สะบักนูนที่สุดของแต่ละฝั่ง 'แยกกันอิสระ' จากพีคความสว่างในแนวตั้ง
-    (ไม่ใช่กล่องนิ่งเทียบค่าเฉลี่ยทั้งโซนแบบเดิม) เพื่อจับได้ทั้ง 2 สัญญาณ:
+    """หาจุดที่สะบักนูนที่สุดของแต่ละฝั่ง 'แยกกันอิสระ' โดยลบแนวโน้มการไล่แสง
+    (ผิวหลังสว่างไล่ระดับจากไหล่ลงเอวตามธรรมชาติ ถ้าหาแค่ 'แถวที่สว่างที่สุด' เฉยๆ
+    จะไปเกาะที่ขอบบนสุดเสมอ ไม่ใช่ตัวสะบักจริง) จึงต้อง detrend ก่อน:
+    ลบค่าเฉลี่ยเคลื่อนที่แบบ smooth ออกจากสัญญาณ เหลือแต่ส่วนที่ 'นูนกว่าแนวโน้มรอบข้าง'
+    แล้วหาจุดสูงสุดของส่วนที่เหลือนั้นแทน ได้ 2 สัญญาณ:
     - ตำแหน่งสูง/ต่ำของสะบักแต่ละข้าง (บางคนสะบักข้างหนึ่งอยู่สูงกว่าอีกข้างจริง)
-    - ระดับความนูนของแต่ละข้าง (จากความสว่างที่จุดพีคนั้น)
+    - ระดับความนูนของแต่ละข้าง (จากขนาดของตุ่มที่เหลือหลัง detrend)
     คืนค่า dict ของผล หรือ None ถ้าโซนเล็กเกินไป"""
     if y_bottom <= y_top + 10 or not (0 < x_center < w):
         return None
     region = image_bgr[y_top:y_bottom, :, :]
     h_r, w_r, _ = region.shape
-    if h_r < 10 or w_r < 10:
+    if h_r < 20 or w_r < 10:
         return None
-    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY).astype(np.float32)
     cx = min(x_center, w_r - 1)
     left_gray, right_gray = gray[:, :cx], gray[:, cx:]
     if left_gray.shape[1] < 5 or right_gray.shape[1] < 5:
         return None
 
-    left_profile  = left_gray.mean(axis=1)
-    right_profile = right_gray.mean(axis=1)
-    left_peak_row  = int(np.argmax(left_profile))
-    right_peak_row = int(np.argmax(right_profile))
-    left_peak_val  = float(left_profile[left_peak_row])
-    right_peak_val = float(right_profile[right_peak_row])
+    def detrended_peak(profile_2d):
+        profile = profile_2d.mean(axis=1)  # ความสว่างเฉลี่ยต่อแถว
+        n = len(profile)
+        win = max(5, int(n * 0.6))  # หน้าต่าง smooth กว้าง ~60% ของโซน เพื่อจับแนวโน้มไล่แสงรวม
+        if win % 2 == 0:
+            win += 1
+        kernel = np.ones(win) / win
+        padded = np.pad(profile, (win // 2, win // 2), mode='edge')
+        trend = np.convolve(padded, kernel, mode='valid')[:n]
+        detail = profile - trend  # ส่วนที่ 'นูนกว่าแนวโน้มรอบข้าง' หลังหักการไล่แสงออก
+        peak_row = int(np.argmax(detail))
+        return peak_row, float(profile[peak_row])
+
+    left_peak_row,  left_peak_val  = detrended_peak(left_gray)
+    right_peak_row, right_peak_val = detrended_peak(right_gray)
 
     zone_h = y_bottom - y_top
-    height_diff_px    = left_peak_row - right_peak_row  # บวก = ซ้ายอยู่ต่ำกว่า (row มากกว่า)
-    height_diff_ratio = abs(height_diff_px) / zone_h
+    height_diff_ratio = abs(left_peak_row - right_peak_row) / zone_h
     higher_side  = "Left" if left_peak_row < right_peak_row else "Right" if right_peak_row < left_peak_row else "-"
     prominence_diff = abs(left_peak_val - right_peak_val)
     prominent_side  = "Left" if left_peak_val > right_peak_val else "Right"
@@ -315,7 +326,7 @@ def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w):
     cv2.circle(annotated, right_pt, 6, (0, 255, 120), -1)
     cv2.line(annotated, left_pt, right_pt, (0, 255, 120), 2, cv2.LINE_AA)
     cv2.putText(annotated, f"Scapula: {prominent_side} ({prominence_diff:.1f})",
-                (10, max(y_top - 10, 15)),
+                (10, min(y_bottom + 16, image_bgr.shape[0] - 5)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 120), 1, cv2.LINE_AA)
 
     return {
