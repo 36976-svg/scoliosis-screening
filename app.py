@@ -34,6 +34,8 @@ def load_detector():
 detector = load_detector()
 
 HIP_VISIBILITY_THRESHOLD = 0.5  # ต่ำกว่านี้ถือว่าสะโพกไม่ได้อยู่ในเฟรม/โมเดลไม่มั่นใจ ไม่นำมาใช้คำนวณ
+HIP_SLOPE_MAX_PLAUSIBLE = 0.35  # ~19 องศา ถือว่าสุดขั้วมากแล้วสำหรับสะโพกคนยืนตรง เกินนี้ = จุดหลุดแน่ๆ
+HIP_WIDTH_MIN_RATIO     = 0.5   # เส้นสะโพกต้องกว้างอย่างน้อยครึ่งหนึ่งของเส้นไหล่ ไม่งั้นถือว่าจุดหลุด
 
 # ---------- การหา "เอว" แบบไม่พึ่งจุด landmark สะโพก ----------
 # ใช้การเปรียบเทียบสีของแต่ละพิกเซลกับสีพื้นหลังในแถวเดียวกัน (รองรับพื้นหลังไล่เฉด)
@@ -280,6 +282,21 @@ def analyze_standing(image_bgr):
         dx_h = (right_hip.x - left_hip.x) * w
         dy_h = (right_hip.y - left_hip.y) * h
         hip_slope = abs(dy_h / dx_h) if dx_h != 0 else 0
+
+        # เช็คความสมเหตุสมผลเพิ่มเติม: บาง case MediaPipe มั่นใจสูงแต่จุดหลุดจริง
+        # (เช่น โดนขอบกางเกง/เงาบัง) ทำให้ hip_slope พุ่งเกินจริงทางกายวิภาค
+        # หรือเส้นสะโพกแคบผิดปกติเมื่อเทียบไหล่ -> ถือว่าจุดไม่น่าเชื่อถือ ตัดกลับไปใช้ Waist แทน
+        shoulder_width_px = abs(dx_s)
+        hip_width_px = abs(dx_h)
+        implausible_slope = hip_slope > HIP_SLOPE_MAX_PLAUSIBLE
+        implausible_width = (
+            shoulder_width_px > 0 and
+            hip_width_px < HIP_WIDTH_MIN_RATIO * shoulder_width_px
+        )
+        if implausible_slope or implausible_width:
+            hips_visible = False
+            dy_h = None
+            hip_slope = None
     else:
         dy_h = None
         hip_slope = None
