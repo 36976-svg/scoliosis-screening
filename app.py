@@ -36,7 +36,7 @@ detector = load_detector()
 HIP_VISIBILITY_THRESHOLD = 0.5  # ต่ำกว่านี้ถือว่าสะโพกไม่ได้อยู่ในเฟรม/โมเดลไม่มั่นใจ ไม่นำมาใช้คำนวณ
 HIP_SLOPE_MAX_PLAUSIBLE = 0.35  # ~19 องศา ถือว่าสุดขั้วมากแล้วสำหรับสะโพกคนยืนตรง เกินนี้ = จุดหลุดแน่ๆ
 HIP_WIDTH_MIN_RATIO     = 0.5   # เส้นสะโพกต้องกว้างอย่างน้อยครึ่งหนึ่งของเส้นไหล่ ไม่งั้นถือว่าจุดหลุด
-SCAPULA_ZONE_FRAC = 0.35  # สัดส่วนช่วงไหล่-เอวที่นับเป็นโซนสะบัก (นับจากใต้ไหล่ลงมา)
+SCAPULA_ZONE_FRAC = 0.45  # สัดส่วนช่วงไหล่-เอวที่นับเป็นโซนสะบัก (นับจากใต้ไหล่ลงมา)
 
 # ---------- การหา "เอว" แบบไม่พึ่งจุด landmark สะโพก ----------
 # ใช้การเปรียบเทียบสีของแต่ละพิกเซลกับสีพื้นหลังในแถวเดียวกัน (รองรับพื้นหลังไล่เฉด)
@@ -276,6 +276,56 @@ def measure_zone_brightness(image_bgr, annotated, y_top, y_bottom, x_center, w,
     return diff, side
 
 
+def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w):
+    """หาจุดที่สะบักนูนที่สุดของแต่ละฝั่ง 'แยกกันอิสระ' จากพีคความสว่างในแนวตั้ง
+    (ไม่ใช่กล่องนิ่งเทียบค่าเฉลี่ยทั้งโซนแบบเดิม) เพื่อจับได้ทั้ง 2 สัญญาณ:
+    - ตำแหน่งสูง/ต่ำของสะบักแต่ละข้าง (บางคนสะบักข้างหนึ่งอยู่สูงกว่าอีกข้างจริง)
+    - ระดับความนูนของแต่ละข้าง (จากความสว่างที่จุดพีคนั้น)
+    คืนค่า dict ของผล หรือ None ถ้าโซนเล็กเกินไป"""
+    if y_bottom <= y_top + 10 or not (0 < x_center < w):
+        return None
+    region = image_bgr[y_top:y_bottom, :, :]
+    h_r, w_r, _ = region.shape
+    if h_r < 10 or w_r < 10:
+        return None
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    cx = min(x_center, w_r - 1)
+    left_gray, right_gray = gray[:, :cx], gray[:, cx:]
+    if left_gray.shape[1] < 5 or right_gray.shape[1] < 5:
+        return None
+
+    left_profile  = left_gray.mean(axis=1)
+    right_profile = right_gray.mean(axis=1)
+    left_peak_row  = int(np.argmax(left_profile))
+    right_peak_row = int(np.argmax(right_profile))
+    left_peak_val  = float(left_profile[left_peak_row])
+    right_peak_val = float(right_profile[right_peak_row])
+
+    zone_h = y_bottom - y_top
+    height_diff_px    = left_peak_row - right_peak_row  # บวก = ซ้ายอยู่ต่ำกว่า (row มากกว่า)
+    height_diff_ratio = abs(height_diff_px) / zone_h
+    higher_side  = "Left" if left_peak_row < right_peak_row else "Right" if right_peak_row < left_peak_row else "-"
+    prominence_diff = abs(left_peak_val - right_peak_val)
+    prominent_side  = "Left" if left_peak_val > right_peak_val else "Right"
+
+    left_pt  = (x_center - cx // 2,               y_top + left_peak_row)
+    right_pt = (x_center + (w_r - cx) // 2,        y_top + right_peak_row)
+
+    cv2.circle(annotated, left_pt,  6, (0, 255, 120), -1)
+    cv2.circle(annotated, right_pt, 6, (0, 255, 120), -1)
+    cv2.line(annotated, left_pt, right_pt, (0, 255, 120), 2, cv2.LINE_AA)
+    cv2.putText(annotated, f"Scapula: {prominent_side} ({prominence_diff:.1f})",
+                (10, max(y_top - 10, 15)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 120), 1, cv2.LINE_AA)
+
+    return {
+        "height_diff_ratio": height_diff_ratio,
+        "higher_side": higher_side,
+        "prominence_diff": prominence_diff,
+        "prominent_side": prominent_side,
+    }
+
+
 def analyze_standing(image_bgr):
     h, w, _ = image_bgr.shape
     rgb_image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -411,13 +461,22 @@ def analyze_standing(image_bgr):
         image_bgr, annotated, mid_shoulder_y, mid_hip_y, mid_shoulder_x, w,
         label="Rib Hump", label_y_offset=-10)
 
-    # Scapula Prominence: เทียบความสว่างซ้าย-ขวาเฉพาะโซนสะบัก (ใต้ไหล่ลงมา ~35%
-    # ของช่วงไหล่-เอว) เพราะสะบักนูนไม่เท่ากันเป็นสัญญาณคัดกรองแยกจาก Rib Hump ทั้งแผ่นหลัง
+    # Scapula: หาจุดนูนสุดของสะบักแต่ละฝั่งแยกกัน (ปรับตามตำแหน่งจริง ไม่ใช่กล่องนิ่ง)
+    # ขยายโซนถึง ~45% ของช่วงไหล่-เอว ให้มีที่ว่างพอให้จุดพีคขยับตามความสูง-ต่ำได้จริง
     scapula_y_top = mid_shoulder_y
     scapula_y_bottom = mid_shoulder_y + int(SCAPULA_ZONE_FRAC * (mid_hip_y - mid_shoulder_y))
-    scapula_diff, scapula_side = measure_zone_brightness(
-        image_bgr, annotated, scapula_y_top, scapula_y_bottom, mid_shoulder_x, w,
-        label="Scapula", label_y_offset=14, box_color_hint=(0, 255, 120))
+    scapula_result = find_scapula_peaks(
+        image_bgr, annotated, scapula_y_top, scapula_y_bottom, mid_shoulder_x, w)
+    if scapula_result:
+        scapula_diff          = scapula_result["prominence_diff"]
+        scapula_side          = scapula_result["prominent_side"]
+        scapula_height_ratio  = scapula_result["height_diff_ratio"]
+        scapula_higher_side   = scapula_result["higher_side"]
+    else:
+        scapula_diff = 0.0
+        scapula_side = "-"
+        scapula_height_ratio = 0.0
+        scapula_higher_side = "-"
 
     y_top, y_bottom = mid_shoulder_y, mid_hip_y  # ใช้ต่อสำหรับหา Waist
 
@@ -456,6 +515,8 @@ def analyze_standing(image_bgr):
         "rib_hump_side":        rib_hump_side,
         "scapula_diff":         scapula_diff,
         "scapula_side":         scapula_side,
+        "scapula_height_ratio": scapula_height_ratio,
+        "scapula_higher_side":  scapula_higher_side,
         "spine_dev_ratio":      spine_info["max_dev_ratio"],
         "spine_dev_dir":        spine_info["max_dev_dir"],
         "spine_joint_devs":     spine_info["joint_devs"],
@@ -688,6 +749,9 @@ else:
             with col8:
                 st.metric("Scapula Prominence", f"{result['scapula_diff']:.1f}")
                 st.write(f"**สะบักด้านที่นูนกว่า:** {result['scapula_side']}")
+                if result["scapula_higher_side"] != "-":
+                    st.caption(f"สะบักด้านที่อยู่สูงกว่า: {result['scapula_higher_side']} "
+                               f"(ต่างกัน {result['scapula_height_ratio']*100:.1f}% ของช่วงที่วัด)")
 
             if not result["hips_visible"]:
                 curve_note = "ไม่เห็นสะโพกในภาพ จึงยังไม่สามารถบอกลักษณะการบิดของลำตัวทั้งท่อนได้"
