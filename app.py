@@ -576,6 +576,9 @@ RECOMMENDATIONS = {
 
 SLOPE_LOW, SLOPE_HIGH = 0.05, 0.15
 SPINE_DEV_LOW, SPINE_DEV_HIGH = 0.02, 0.05  # สัดส่วนการเบี่ยงเบนต่อความยาวลำตัว (คอ-สะโพก)
+RIB_HUMP_LOW, RIB_HUMP_HIGH = 3.0, 8.0        # ความต่างความสว่างซ้าย-ขวา (สเกล 0-255)
+SCAPULA_DIFF_LOW, SCAPULA_DIFF_HIGH = 3.0, 8.0  # ความนูนต่างกัน (สเกลเดียวกับ Rib Hump)
+SCAPULA_HEIGHT_LOW, SCAPULA_HEIGHT_HIGH = 0.10, 0.25  # สัดส่วนตำแหน่งสูง-ต่ำต่างกัน ต่อความสูงโซนที่วัด
 baseline = load_baseline()
 
 st.sidebar.title("เมนู")
@@ -717,6 +720,16 @@ else:
                         result["waist_slope"], baseline["waist_slope"]["mean"], baseline["waist_slope"]["sd"])
                 elif result["waist_detected"]:
                     waist_risk, waist_color = get_risk_level_default(result["waist_slope"], SLOPE_LOW, SLOPE_HIGH)
+                if baseline.get("rib_hump_diff"):
+                    rib_hump_risk, rib_hump_color = get_risk_level_baseline(
+                        result["rib_hump_diff"], baseline["rib_hump_diff"]["mean"], baseline["rib_hump_diff"]["sd"])
+                else:
+                    rib_hump_risk, rib_hump_color = get_risk_level_default(result["rib_hump_diff"], RIB_HUMP_LOW, RIB_HUMP_HIGH)
+                if baseline.get("scapula_diff"):
+                    scapula_diff_risk, _ = get_risk_level_baseline(
+                        result["scapula_diff"], baseline["scapula_diff"]["mean"], baseline["scapula_diff"]["sd"])
+                else:
+                    scapula_diff_risk, _ = get_risk_level_default(result["scapula_diff"], SCAPULA_DIFF_LOW, SCAPULA_DIFF_HIGH)
             else:
                 shoulder_risk, shoulder_color = get_risk_level_default(result["shoulder_slope"], SLOPE_LOW, SLOPE_HIGH)
                 spine_risk, spine_color       = get_risk_level_default(result["spine_dev_ratio"], SPINE_DEV_LOW, SPINE_DEV_HIGH)
@@ -724,6 +737,15 @@ else:
                     hip_risk, hip_color = get_risk_level_default(result["hip_slope"], SLOPE_LOW, SLOPE_HIGH)
                 if result["waist_detected"]:
                     waist_risk, waist_color = get_risk_level_default(result["waist_slope"], SLOPE_LOW, SLOPE_HIGH)
+                rib_hump_risk, rib_hump_color = get_risk_level_default(result["rib_hump_diff"], RIB_HUMP_LOW, RIB_HUMP_HIGH)
+                scapula_diff_risk, _ = get_risk_level_default(result["scapula_diff"], SCAPULA_DIFF_LOW, SCAPULA_DIFF_HIGH)
+
+            # Scapula มี 2 สัญญาณ (ความนูน + ตำแหน่งสูง-ต่ำ) เอาตัวที่เสี่ยงกว่ามาเป็นตัวแทน
+            scapula_height_risk, _ = get_risk_level_default(result["scapula_height_ratio"], SCAPULA_HEIGHT_LOW, SCAPULA_HEIGHT_HIGH)
+            scapula_risk = max([scapula_diff_risk, scapula_height_risk],
+                                key=lambda r: ["ต่ำ (ปกติ)", "ปานกลาง", "สูง"].index(r))
+            scapula_color = {"ต่ำ (ปกติ)": "green", "ปานกลาง": "orange", "สูง": "red"}[scapula_risk]
+            rib_hump_display_color = rib_hump_color
 
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -745,6 +767,7 @@ else:
             col4, col5, col6 = st.columns(3)
             with col4:
                 st.metric("Rib Hump Diff", f"{result['rib_hump_diff']:.1f}")
+                st.markdown(f"ความเสี่ยง: :{rib_hump_display_color}[{rib_hump_risk}]")
             with col5:
                 st.write(f"**ด้านที่นูนกว่า:** {result['rib_hump_side']}")
             with col6:
@@ -761,6 +784,7 @@ else:
                     st.markdown("ไม่พบแนวเอวในภาพ")
             with col8:
                 st.metric("Scapula Prominence", f"{result['scapula_diff']:.1f}")
+                st.markdown(f"ความเสี่ยง: :{scapula_color}[{scapula_risk}]")
                 st.write(f"**สะบักด้านที่นูนกว่า:** {result['scapula_side']}")
                 if result["scapula_higher_side"] != "-":
                     st.caption(f"สะบักด้านที่อยู่สูงกว่า: {result['scapula_higher_side']} "
@@ -781,7 +805,7 @@ else:
                 waist_dir_label = {"right_up": "เอียงขึ้นทางขวา", "left_up": "เอียงขึ้นทางซ้าย", "level": "ไม่เอียงชัดเจน"}.get(result["waist_tilt_dir"], "-")
                 st.caption(f"แนวเอว: {waist_dir_label} (Waist Slope {result['waist_slope']:.4f})")
 
-            risk_pool = [shoulder_risk, spine_risk]
+            risk_pool = [shoulder_risk, spine_risk, rib_hump_risk, scapula_risk]
             if result["hips_visible"]:
                 risk_pool.append(hip_risk)
             if result["waist_detected"]:
