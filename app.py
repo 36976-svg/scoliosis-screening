@@ -367,10 +367,6 @@ def draw_spine_chain(img, points, dev_low_ratio=0.02, dev_high_ratio=0.05):
     }
 
 
-
-    return diff, side
-
-
 def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w,
                         person_mask=None, edge_margin_frac=0.12, min_significance=1.5):
     """หาจุดที่สะบักนูนที่สุดของแต่ละฝั่ง 'แยกกันอิสระ' โดยลบแนวโน้มการไล่แสง
