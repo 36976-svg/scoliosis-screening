@@ -27,7 +27,9 @@ def load_detector():
     base_options = python.BaseOptions(model_asset_path=MODEL_FILE)
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
-        running_mode=vision.RunningMode.IMAGE
+        running_mode=vision.RunningMode.IMAGE,
+        output_segmentation_masks=True  # ใช้โมเดล AI ของ MediaPipe แยกคนออกจากพื้นหลัง
+                                         # แทนการเดาสีพื้นหลังเอง รองรับพื้นหลังซับซ้อนได้จริง
     )
     return vision.PoseLandmarker.create_from_options(options)
 
@@ -361,16 +363,21 @@ def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w,
 def analyze_standing(image_bgr):
     h, w, _ = image_bgr.shape
 
-    # ขั้นตอนก่อนวิเคราะห์: แปลงภาพเป็น mask ขาว-ดำ (คน=พื้นหลัง) ครั้งเดียว
-    # ใช้ร่วมกันทั้ง Waist และ Scapula detection แทนที่จะให้แต่ละจุดไปประมาณเอง
-    person_mask = get_person_mask(image_bgr)
-
     rgb_image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
     result    = detector.detect(mp_image)
 
     if not result.pose_landmarks:
         return None, None
+
+    # ขั้นตอนก่อนวิเคราะห์: แยกคนออกจากพื้นหลังด้วย segmentation mask ของ MediaPipe เอง
+    # (โมเดล AI ที่เทรนมาแยกคน ไม่ใช่การเดาสีพื้นหลังแบบ heuristic) รองรับพื้นหลังซับซ้อน
+    # (เช่น มีเฟอร์นิเจอร์/ลวดลาย) ได้ดีกว่ามาก ใช้ร่วมกันทั้ง Waist และ Scapula detection
+    if result.segmentation_masks:
+        seg = result.segmentation_masks[0].numpy_view()  # ค่า 0-1 = ความมั่นใจว่าเป็นคน
+        person_mask = seg > 0.5
+    else:
+        person_mask = get_person_mask(image_bgr)  # กันไว้เผื่อโมเดลไม่คืน mask มาให้
 
     landmarks      = result.pose_landmarks[0]
     nose           = landmarks[0]
