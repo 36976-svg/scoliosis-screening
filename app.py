@@ -560,6 +560,7 @@ def analyze_standing(image_bgr):
         "waist_detected":       waist_detected,
         "waist_slope":          waist_slope,
         "waist_tilt_dir":       waist_tilt_dir,
+        "person_mask":          person_mask,
     }, annotated
 
 
@@ -715,6 +716,22 @@ else:
         if result is None:
             st.error("ไม่พบร่างกายในภาพ กรุณาลองใหม่")
         else:
+            with st.expander("🔍 ดูขั้นตอนการประมวลผล (Processing Steps)", expanded=False):
+                step1, step2, step3 = st.columns(3)
+                with step1:
+                    st.caption("1) ภาพต้นฉบับ")
+                    st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
+                with step2:
+                    st.caption("2) Person Mask (ขาว = คน, ดำ = พื้นหลัง)")
+                    mask_img = (result["person_mask"].astype(np.uint8) * 255)
+                    st.image(mask_img, use_container_width=True)
+                with step3:
+                    st.caption("3) จุด Landmark + วิเคราะห์ (ผลลัพธ์สุดท้าย)")
+                    st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
+                st.caption("ขั้นตอน: (1) รับภาพต้นฉบับ → (2) แปลงเป็น mask ขาว-ดำด้วยการเทียบสีแต่ละพิกเซล"
+                           "กับพื้นหลังที่ประมาณจาก 4 มุมภาพ คัดแยกส่วนที่เป็นคนออกจากพื้นหลัง → "
+                           "(3) ใช้ mask ร่วมกับจุด Landmark จาก MediaPipe วิเคราะห์ Waist/Scapula/Spine ต่อ")
+
             annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
             st.image(annotated_rgb,
                      caption="จุดแดง = ไหล่ (และสะโพกถ้าเห็นในภาพ) | จุดม่วง = เอว (หาจากรูปทรงลำตัว) | เส้นเหลือง = แนวกระดูกสันหลัง (คอ→ไหล่→อก/เอว→สะโพกหรือขอบภาพ) | "
