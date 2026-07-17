@@ -131,6 +131,8 @@ def find_waist_points(image_bgr, y_top, y_bottom,
 
     if person_mask is None:
         person_mask = get_person_mask(image_bgr, bg_dist_threshold)
+    if person_mask.shape[:2] != (h, w):
+        person_mask = get_person_mask(image_bgr, bg_dist_threshold)  # กันขนาดไม่ตรง ใช้ heuristic แทน
 
     bridge_gap = max(4, int(w * bridge_gap_frac))
     min_width  = w * min_width_frac
@@ -298,7 +300,12 @@ def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w,
 
     if person_mask is None:
         person_mask = get_person_mask(image_bgr)
-    mask_region = person_mask[y_top:y_bottom, :]
+    if person_mask.shape[:2] != image_bgr.shape[:2]:
+        # กันเผื่อ mask ที่ส่งเข้ามาขนาดไม่ตรงกับภาพ (ไม่ควรเกิดถ้า resize ไว้ถูกต้องแล้ว
+        # แต่กันไว้อีกชั้นไม่ให้แอปพัง) — ถือว่าทุกพิกเซลเป็นคนไปเลยแทน
+        mask_region = np.ones((h_r, w_r), dtype=bool)
+    else:
+        mask_region = person_mask[y_top:y_bottom, :]
 
     left_gray,  right_gray  = gray[:, :cx],        gray[:, cx:]
     left_mask,  right_mask  = mask_region[:, :cx], mask_region[:, cx:]
@@ -373,11 +380,17 @@ def analyze_standing(image_bgr):
     # ขั้นตอนก่อนวิเคราะห์: แยกคนออกจากพื้นหลังด้วย segmentation mask ของ MediaPipe เอง
     # (โมเดล AI ที่เทรนมาแยกคน ไม่ใช่การเดาสีพื้นหลังแบบ heuristic) รองรับพื้นหลังซับซ้อน
     # (เช่น มีเฟอร์นิเจอร์/ลวดลาย) ได้ดีกว่ามาก ใช้ร่วมกันทั้ง Waist และ Scapula detection
+    person_mask = None
     if result.segmentation_masks:
-        seg = result.segmentation_masks[0].numpy_view()  # ค่า 0-1 = ความมั่นใจว่าเป็นคน
-        person_mask = seg > 0.5
-    else:
-        person_mask = get_person_mask(image_bgr)  # กันไว้เผื่อโมเดลไม่คืน mask มาให้
+        try:
+            seg = result.segmentation_masks[0].numpy_view()  # ค่า 0-1 = ความมั่นใจว่าเป็นคน
+            if seg.shape[:2] != (h, w):
+                seg = cv2.resize(seg, (w, h), interpolation=cv2.INTER_LINEAR)  # กันขนาดไม่ตรงกับภาพต้นฉบับ
+            person_mask = seg > 0.5
+        except Exception:
+            person_mask = None
+    if person_mask is None:
+        person_mask = get_person_mask(image_bgr)  # กันไว้เผื่อโมเดลไม่คืน mask มาให้ หรือ resize พลาด
 
     landmarks      = result.pose_landmarks[0]
     nose           = landmarks[0]
