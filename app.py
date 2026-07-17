@@ -82,12 +82,30 @@ def get_person_mask(image_bgr, bg_dist_threshold=35):
     return diffs > bg_dist_threshold
 
 
+def fill_mask_holes(person_mask):
+    """เติมรูโหว่ภายใน mask (เช่น จุดที่โมเดล segmentation เข้าใจผิดว่าเป็นพื้นหลัง
+    เพราะเงา/ไฝ/แสงตกกระทบผิวหนังจนดูสีต่างจากผิวรอบข้าง) ด้วยเทคนิค flood-fill
+    จากมุมภาพ (ซึ่งเป็นพื้นหลังแน่นอนเสมอ) พื้นที่ใดที่ flood-fill จากพื้นหลังไปไม่ถึง
+    แต่ไม่ใช่คนเดิม = รูโหว่ภายในลำตัว ให้เติมเป็นคนแทน กันรูโหว่ไปรบกวนการวัด
+    ความสว่าง/รูปทรงของ Waist และ Scapula"""
+    mask_u8 = person_mask.astype(np.uint8) * 255
+    h, w = mask_u8.shape
+    ff = mask_u8.copy()
+    ff_mask = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(ff, ff_mask, (0, 0), 255)
+    ff_inv = cv2.bitwise_not(ff)
+    filled = mask_u8 | ff_inv
+    return filled > 0
+
+
 def refine_person_mask(person_mask, erosion_frac=0.004):
     """โมเดล AI segmentation ของ MediaPipe บางทีทำให้ช่องว่างแคบๆ ระหว่างแขนกับลำตัว
     (เช่น ใต้รักแร้) เรียบจนเชื่อมติดกันผิดพลาด (ต่างจากการเทียบสีดิบที่เห็นช่องว่างจริง)
-    ใช้ morphological erosion เบาๆ 'แทะ' ขอบ mask ออกเล็กน้อย เพื่อพยายามเปิดช่องว่างแคบๆ
-    ที่ควรมีอยู่จริงกลับมา โดยไม่กระทบรูปทรงโดยรวมมากเกินไป (ช่วยได้เฉพาะช่องว่างที่แคบมากๆ
-    ถ้าโมเดลเชื่อมกว้างเกินไปวิธีนี้จะช่วยไม่ได้ทั้งหมด)"""
+    และบางทีก็เผลอเจาะรูโหว่ผิดๆ กลางลำตัว (เช่น จุดที่มีเงา/ไฝ) จึงทำ 2 ขั้นตอน:
+    (1) เติมรูโหว่ภายในก่อน (2) ค่อยใช้ morphological erosion เบาๆ 'แทะ' ขอบออก
+    เพื่อพยายามเปิดช่องว่างแคบๆ ที่ควรมีอยู่จริงกลับมา โดยไม่กระทบรูปทรงโดยรวมมากเกินไป
+    (erosion ช่วยได้เฉพาะช่องว่างที่แคบมากๆ ถ้าโมเดลเชื่อมกว้างเกินไปวิธีนี้จะช่วยไม่ได้ทั้งหมด)"""
+    person_mask = fill_mask_holes(person_mask)
     h, w = person_mask.shape
     k = max(1, int(min(h, w) * erosion_frac))
     if k < 2:
