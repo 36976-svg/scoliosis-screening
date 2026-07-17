@@ -82,6 +82,21 @@ def get_person_mask(image_bgr, bg_dist_threshold=35):
     return diffs > bg_dist_threshold
 
 
+def refine_person_mask(person_mask, erosion_frac=0.004):
+    """โมเดล AI segmentation ของ MediaPipe บางทีทำให้ช่องว่างแคบๆ ระหว่างแขนกับลำตัว
+    (เช่น ใต้รักแร้) เรียบจนเชื่อมติดกันผิดพลาด (ต่างจากการเทียบสีดิบที่เห็นช่องว่างจริง)
+    ใช้ morphological erosion เบาๆ 'แทะ' ขอบ mask ออกเล็กน้อย เพื่อพยายามเปิดช่องว่างแคบๆ
+    ที่ควรมีอยู่จริงกลับมา โดยไม่กระทบรูปทรงโดยรวมมากเกินไป (ช่วยได้เฉพาะช่องว่างที่แคบมากๆ
+    ถ้าโมเดลเชื่อมกว้างเกินไปวิธีนี้จะช่วยไม่ได้ทั้งหมด)"""
+    h, w = person_mask.shape
+    k = max(1, int(min(h, w) * erosion_frac))
+    if k < 2:
+        return person_mask
+    kernel = np.ones((k, k), np.uint8)
+    eroded = cv2.erode(person_mask.astype(np.uint8), kernel, iterations=1)
+    return eroded.astype(bool)
+
+
 def apply_high_contrast(image_bgr, person_mask):
     """แปลงภาพ (ที่ตัดพื้นหลังออกแล้ว) เป็นขาวดำ contrast สูงสุด: แปลงเป็น grayscale
     แล้วยืดช่วงความสว่างของพิกเซล 'คน' เท่านั้นให้เต็มช่วง 0-255 (contrast stretching
@@ -446,6 +461,10 @@ def analyze_standing(image_bgr):
             person_mask = None
     if person_mask is None:
         person_mask = get_person_mask(image_bgr)  # กันไว้เผื่อโมเดลไม่คืน mask มาให้ หรือ resize พลาด
+
+    # ลบส่วนที่ mask อาจเชื่อมติดกันผิดพลาด (เช่น ช่องว่างใต้รักแร้ระหว่างแขน-ลำตัว)
+    # ด้วย erosion เบาๆ ก่อนนำไปใช้งานต่อ
+    person_mask = refine_person_mask(person_mask)
 
     # ตัดพื้นหลังออกจริง: ทาสีส่วนที่ไม่ใช่คนให้เป็นดำล้วน โดยไม่เปลี่ยนขนาด/กรอบภาพ
     bg_removed = image_bgr.copy()
