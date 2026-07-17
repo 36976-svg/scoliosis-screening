@@ -131,7 +131,7 @@ def find_waist_points(image_bgr, y_top, y_bottom,
 
     if person_mask is None:
         person_mask = get_person_mask(image_bgr, bg_dist_threshold)
-    if person_mask.shape[:2] != (h, w):
+    if person_mask.ndim != 2 or person_mask.shape != (h, w):
         person_mask = get_person_mask(image_bgr, bg_dist_threshold)  # กันขนาดไม่ตรง ใช้ heuristic แทน
 
     bridge_gap = max(4, int(w * bridge_gap_frac))
@@ -300,7 +300,7 @@ def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w,
 
     if person_mask is None:
         person_mask = get_person_mask(image_bgr)
-    if person_mask.shape[:2] != image_bgr.shape[:2]:
+    if person_mask.ndim != 2 or person_mask.shape != image_bgr.shape[:2]:
         # กันเผื่อ mask ที่ส่งเข้ามาขนาดไม่ตรงกับภาพ (ไม่ควรเกิดถ้า resize ไว้ถูกต้องแล้ว
         # แต่กันไว้อีกชั้นไม่ให้แอปพัง) — ถือว่าทุกพิกเซลเป็นคนไปเลยแทน
         mask_region = np.ones((h_r, w_r), dtype=bool)
@@ -383,10 +383,14 @@ def analyze_standing(image_bgr):
     person_mask = None
     if result.segmentation_masks:
         try:
-            seg = result.segmentation_masks[0].numpy_view()  # ค่า 0-1 = ความมั่นใจว่าเป็นคน
-            if seg.shape[:2] != (h, w):
+            seg = np.asarray(result.segmentation_masks[0].numpy_view())  # ค่า 0-1 = ความมั่นใจว่าเป็นคน
+            if seg.ndim == 3:
+                seg = seg[:, :, 0]  # numpy_view() บางเวอร์ชันคืนมาเป็น (h,w,1) ต้องบีบให้เหลือ 2 มิติ
+            if seg.shape != (h, w):
                 seg = cv2.resize(seg, (w, h), interpolation=cv2.INTER_LINEAR)  # กันขนาดไม่ตรงกับภาพต้นฉบับ
             person_mask = seg > 0.5
+            if person_mask.shape != (h, w):  # เช็คซ้ำอีกชั้น กันทุกกรณีที่หลุดรอด
+                person_mask = None
         except Exception:
             person_mask = None
     if person_mask is None:
