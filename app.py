@@ -484,6 +484,19 @@ def analyze_standing(image_bgr):
         # (ไม่ใช้ heuristic เดาสีพื้นหลัง เพราะเดาผิดทำให้ฝั่งใดฝั่งหนึ่งกลายเป็นสีดำ)
         person_mask = np.ones((h, w), dtype=bool)
 
+    # ขยาย mask ออกก่อนเพื่อให้ครอบคลุมขอบร่างกายได้สมบูรณ์ขึ้น
+    # (segmentation mask ของ MediaPipe บางครั้งครอบคลุมไม่ถึงขอบจริง ทำให้พื้นหลังขอบๆ หลุดเข้ามา)
+    kernel_dilate = np.ones((15, 15), np.uint8)
+    person_mask_u8 = person_mask.astype(np.uint8) * 255
+    person_mask_u8 = cv2.dilate(person_mask_u8, kernel_dilate, iterations=2)
+    # เติมรูโหว่ภายใน mask ด้วย flood fill จากมุมภาพ
+    ff = person_mask_u8.copy()
+    ff_mask = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(ff, ff_mask, (0, 0), 255)
+    ff_inv = cv2.bitwise_not(ff)
+    person_mask_u8 = person_mask_u8 | ff_inv
+    person_mask = person_mask_u8 > 0
+
     # ลบส่วนที่ mask อาจเชื่อมติดกันผิดพลาด (เช่น ช่องว่างใต้รักแร้ระหว่างแขน-ลำตัว)
     # ด้วย erosion เบาๆ ก่อนนำไปใช้งานต่อ
     person_mask = refine_person_mask(person_mask)
@@ -865,7 +878,7 @@ else:
                 with step4:
                     st.caption("4) Person Mask (ขาว = คน, ดำ = พื้นหลัง)")
                     # สร้างภาพ mask ที่คนเป็นสีขาวล้วน พื้นหลังสีดำล้วน เต็มตัว
-                    mask_vis = np.zeros((image_bgr.shape[0], image_bgr.shape[1]), dtype=np.uint8)
+                    mask_vis = np.zeros_like(image_bgr)
                     mask_vis[result["person_mask"]] = 255
                     st.image(mask_vis, use_container_width=True)
                 with step5:
