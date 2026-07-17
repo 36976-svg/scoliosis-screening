@@ -28,8 +28,10 @@ def load_detector():
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.IMAGE,
-        output_segmentation_masks=True  # ใช้โมเดล AI ของ MediaPipe แยกคนออกจากพื้นหลัง
-                                         # แทนการเดาสีพื้นหลังเอง รองรับพื้นหลังซับซ้อนได้จริง
+        output_segmentation_masks=True,  # ใช้โมเดล AI ของ MediaPipe แยกคนออกจากพื้นหลัง
+                                          # แทนการเดาสีพื้นหลังเอง รองรับพื้นหลังซับซ้อนได้จริง
+        min_pose_detection_confidence=0.6,  # เข้มงวดขึ้นจาก default 0.5 กันจุดที่โมเดลไม่มั่นใจพอ
+        min_pose_presence_confidence=0.6,
     )
     return vision.PoseLandmarker.create_from_options(options)
 
@@ -94,6 +96,31 @@ def apply_high_contrast(image_bgr, person_mask):
     stretched = np.clip((gray.astype(np.float32) - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
     stretched[~person_mask] = 0  # พื้นหลังยังดำล้วน
     return cv2.cvtColor(stretched, cv2.COLOR_GRAY2BGR)
+
+
+def check_arms_natural(left_shoulder, left_elbow, right_shoulder, right_elbow, w, h, max_angle_deg=40):
+    """ใช้จุดศอก (landmark 13, 14) เช็คว่าแขนห้อยลงข้างลำตัวตามธรรมชาติจริงไหม
+    (ไม่ใช่ยกแขน/กางแขน/เอามือเท้าเอว) เพราะท่าแขนผิดปกติจะทำให้รูปทรงลำตัวที่เห็น
+    ในภาพเพี้ยนไป กระทบความแม่นยำของ Waist/Scapula ที่วัดจากรูปทรงลำตัวโดยตรง
+    วัดมุมของเวกเตอร์ไหล่→ศอก เทียบกับแนวดิ่ง ถ้าเกิน max_angle_deg ถือว่าผิดธรรมชาติ
+    คืนค่า (arms_natural: bool, sides_warned: list ของ 'ซ้าย'/'ขวา' ที่ผิดปกติ)"""
+    def arm_angle_deg(shoulder, elbow):
+        dx = (elbow.x - shoulder.x) * w
+        dy = (elbow.y - shoulder.y) * h
+        if dy <= 0:  # ศอกอยู่สูงกว่าหรือเท่ากับไหล่ = ยกแขนขึ้นชัดเจน ผิดธรรมชาติแน่นอน
+            return 90.0
+        return math.degrees(math.atan2(abs(dx), dy))
+
+    left_angle  = arm_angle_deg(left_shoulder, left_elbow)
+    right_angle = arm_angle_deg(right_shoulder, right_elbow)
+
+    sides_warned = []
+    if left_angle > max_angle_deg:
+        sides_warned.append("ซ้าย")
+    if right_angle > max_angle_deg:
+        sides_warned.append("ขวา")
+
+    return len(sides_warned) == 0, sides_warned
 
 
 def _merge_close_runs(fg_row, max_bridge_gap):
@@ -427,10 +454,17 @@ def analyze_standing(image_bgr):
     right_ear      = landmarks[8]
     left_shoulder  = landmarks[11]
     right_shoulder = landmarks[12]
+    left_elbow     = landmarks[13]
+    right_elbow    = landmarks[14]
     left_hip       = landmarks[23]
     right_hip      = landmarks[24]
     left_knee      = landmarks[25]
     right_knee     = landmarks[26]
+
+    # เช็คว่าแขนห้อยข้างลำตัวตามธรรมชาติไหม (ใช้จุดศอกจาก MediaPipe) เพื่อความแม่นยำของ
+    # Waist/Scapula ที่วัดจากรูปทรงลำตัว ถ้าแขนอยู่ในท่าผิดปกติ ผลอาจคลาดเคลื่อนได้
+    arms_natural, arm_warn_sides = check_arms_natural(
+        left_shoulder, left_elbow, right_shoulder, right_elbow, w, h)
 
     dx_s = (right_shoulder.x - left_shoulder.x) * w
     dy_s = (right_shoulder.y - left_shoulder.y) * h
@@ -612,6 +646,8 @@ def analyze_standing(image_bgr):
         "person_mask":          person_mask,
         "bg_removed":           bg_removed,
         "contrast_img":         contrast_img,
+        "arms_natural":         arms_natural,
+        "arm_warn_sides":       arm_warn_sides,
     }, annotated
 
 
@@ -804,6 +840,12 @@ else:
                            "แนะนำให้ถ่ายภาพให้เห็นตั้งแต่ไหล่ถึงเอวอย่างน้อย เพื่อความแม่นยำที่ดีขึ้น")
             elif not result["hips_visible"]:
                 st.info("ℹ️ ไม่เห็นสะโพกในภาพ แต่ตรวจพบแนวเอวแทนได้ ระบบจะใช้ Waist Slope ช่วยประเมินความเอียงของลำตัวส่วนล่าง")
+
+            if not result["arms_natural"]:
+                sides_text = " และ ".join(result["arm_warn_sides"])
+                st.warning(f"⚠️ ท่าแขนข้าง{sides_text}ดูไม่ห้อยตรงตามธรรมชาติ (อาจยกแขน/กางแขน/เอามือเท้าเอว) "
+                           "อาจทำให้รูปทรงลำตัวที่ใช้วัด Waist/Scapula คลาดเคลื่อนได้ "
+                           "แนะนำให้ถ่ายใหม่โดยปล่อยแขนแนบลำตัวตามธรรมชาติเพื่อความแม่นยำสูงสุด")
 
             if baseline and "spine_dev_ratio" in baseline:
                 shoulder_risk, shoulder_color = get_risk_level_baseline(
