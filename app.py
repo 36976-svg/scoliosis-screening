@@ -98,6 +98,22 @@ def fill_mask_holes(person_mask):
     return filled > 0
 
 
+def mask_covers_landmarks(person_mask, points_px, radius_frac=0.02):
+    """เช็คว่า mask ที่ได้มาครอบคลุมตำแหน่งจุด landmark ที่รู้อยู่แล้วว่าเป็นร่างกายจริง
+    (เช่น จุดไหล่ซ้าย-ขวาจาก Pose) หรือไม่ ถ้า mask บอกว่าตรงจุดนั้น 'ไม่ใช่คน' ทั้งที่
+    Pose landmark ยืนยันแล้วว่าเป็นไหล่จริง แปลว่า mask ผิดพลาดร้ายแรง (เช่น หายไปครึ่งซีก)
+    ควรเลิกเชื่อ mask นั้นแล้ว fallback ไปใช้วิธีอื่นแทน"""
+    h, w = person_mask.shape
+    radius = max(3, int(min(h, w) * radius_frac))
+    for (px, py) in points_px:
+        x0, x1 = max(0, px - radius), min(w, px + radius + 1)
+        y0, y1 = max(0, py - radius), min(h, py + radius + 1)
+        patch = person_mask[y0:y1, x0:x1]
+        if patch.size == 0 or patch.mean() < 0.5:
+            return False
+    return True
+
+
 def refine_person_mask(person_mask, erosion_frac=0.004):
     """โมเดล AI segmentation ของ MediaPipe บางทีทำให้ช่องว่างแคบๆ ระหว่างแขนกับลำตัว
     (เช่น ใต้รักแร้) เรียบจนเชื่อมติดกันผิดพลาด (ต่างจากการเทียบสีดิบที่เห็นช่องว่างจริง)
@@ -479,6 +495,19 @@ def analyze_standing(image_bgr):
             person_mask = None
     if person_mask is None:
         person_mask = get_person_mask(image_bgr)  # กันไว้เผื่อโมเดลไม่คืน mask มาให้ หรือ resize พลาด
+
+    # เช็คความน่าเชื่อถือของ mask ด้วยจุด landmark ที่รู้แน่นอนแล้วว่าเป็นร่างกายจริง
+    # (ไหล่ซ้าย-ขวา, สะโพกซ้าย-ขวาถ้าเชื่อถือได้) ถ้า mask พลาดร้ายแรง (เช่น หายไปครึ่งซีก)
+    # ให้เลิกใช้ segmentation mask แล้ว fallback ไปใช้ heuristic เทียบสีพื้นหลังแทน
+    lm0 = result.pose_landmarks[0]
+    check_points_px = [
+        (int(lm0[11].x * w), int(lm0[11].y * h)),  # left_shoulder
+        (int(lm0[12].x * w), int(lm0[12].y * h)),  # right_shoulder
+    ]
+    if not mask_covers_landmarks(person_mask, check_points_px):
+        person_mask = get_person_mask(image_bgr)  # segmentation mask ผิดพลาด fallback ไป heuristic
+        if not mask_covers_landmarks(person_mask, check_points_px):
+            pass  # heuristic ก็ยังพลาดอีก ใช้เท่าที่มีไปก่อน (ไม่มีวิธีที่ 3 ให้ fallback ต่อ)
 
     # ลบส่วนที่ mask อาจเชื่อมติดกันผิดพลาด (เช่น ช่องว่างใต้รักแร้ระหว่างแขน-ลำตัว)
     # ด้วย erosion เบาๆ ก่อนนำไปใช้งานต่อ
