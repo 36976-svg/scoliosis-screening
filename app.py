@@ -865,7 +865,7 @@ else:
                 with step4:
                     st.caption("4) Person Mask (ขาว = คน, ดำ = พื้นหลัง)")
                     # สร้างภาพ mask ที่คนเป็นสีขาวล้วน พื้นหลังสีดำล้วน เต็มตัว
-                    mask_vis = np.zeros_like(image_bgr)
+                    mask_vis = np.zeros((image_bgr.shape[0], image_bgr.shape[1]), dtype=np.uint8)
                     mask_vis[result["person_mask"]] = 255
                     st.image(mask_vis, use_container_width=True)
                 with step5:
