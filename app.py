@@ -28,6 +28,8 @@ def load_detector():
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.IMAGE,
+        output_segmentation_masks=True,  # ใช้โมเดล AI ของ MediaPipe แยกคนออกจากพื้นหลัง
+                                          # แทนการเดาสีพื้นหลังเอง รองรับพื้นหลังซับซ้อนได้จริง
         min_pose_detection_confidence=0.6,  # เข้มงวดขึ้นจาก default 0.5 กันจุดที่โมเดลไม่มั่นใจพอ
         min_pose_presence_confidence=0.6,
     )
@@ -467,11 +469,35 @@ def analyze_standing(image_bgr):
     if not result.pose_landmarks:
         return None, None
 
-    # ขั้นตอนก่อนวิเคราะห์: แยกคนออกจากพื้นหลังด้วยวิธีเทียบสีพื้นหลัง (heuristic)
-    # กลับมาใช้วิธีนี้แทน MediaPipe segmentation mask เพราะเจอปัญหา mask พังร้ายแรง
-    # แบบคาดเดาไม่ได้ (หายไปครึ่งซีก, เจาะรูโหว่กลางตัว) ในบางภาพ วิธีเทียบสีนี้แม้จะพลาด
-    # กับพื้นหลังซับซ้อนมากๆ ได้เหมือนกัน แต่ผลลัพธ์คาดเดาง่ายกว่าและไม่เคยหายไปครึ่งซีก
-    person_mask = get_person_mask(image_bgr)
+    # ขั้นตอนก่อนวิเคราะห์: แยกคนออกจากพื้นหลังด้วย segmentation mask ของ MediaPipe เอง
+    # (โมเดล AI ที่เทรนมาแยกคน ไม่ใช่การเดาสีพื้นหลังแบบ heuristic) รองรับพื้นหลังซับซ้อน
+    # (เช่น มีเฟอร์นิเจอร์/ลวดลาย) ได้ดีกว่ามาก ใช้ร่วมกันทั้ง Waist และ Scapula detection
+    person_mask = None
+    if result.segmentation_masks:
+        try:
+            seg = np.asarray(result.segmentation_masks[0].numpy_view())  # ค่า 0-1 = ความมั่นใจว่าเป็นคน
+            if seg.ndim == 3:
+                seg = seg[:, :, 0]  # numpy_view() บางเวอร์ชันคืนมาเป็น (h,w,1) ต้องบีบให้เหลือ 2 มิติ
+            if seg.shape != (h, w):
+                seg = cv2.resize(seg, (w, h), interpolation=cv2.INTER_LINEAR)  # กันขนาดไม่ตรงกับภาพต้นฉบับ
+            person_mask = seg > 0.5
+            if person_mask.shape != (h, w):  # เช็คซ้ำอีกชั้น กันทุกกรณีที่หลุดรอด
+                person_mask = None
+        except Exception:
+            person_mask = None
+    if person_mask is None:
+        person_mask = get_person_mask(image_bgr)  # กันไว้เผื่อโมเดลไม่คืน mask มาให้ หรือ resize พลาด
+
+    # เช็คความน่าเชื่อถือของ mask ด้วยจุด landmark ที่รู้แน่นอนแล้วว่าเป็นร่างกายจริง
+    # (ไหล่ซ้าย-ขวา) ถ้า mask พลาดร้ายแรง (เช่น หายไปครึ่งซีก) ให้เลิกใช้ segmentation mask
+    # แล้ว fallback ไปใช้ heuristic เทียบสีพื้นหลังแทน
+    lm0 = result.pose_landmarks[0]
+    check_points_px = [
+        (int(lm0[11].x * w), int(lm0[11].y * h)),  # left_shoulder
+        (int(lm0[12].x * w), int(lm0[12].y * h)),  # right_shoulder
+    ]
+    if not mask_covers_landmarks(person_mask, check_points_px):
+        person_mask = get_person_mask(image_bgr)  # segmentation mask ผิดพลาด fallback ไป heuristic
 
     # ลบส่วนที่ mask อาจเชื่อมติดกันผิดพลาด (เช่น ช่องว่างใต้รักแร้ระหว่างแขน-ลำตัว)
     # ด้วย erosion เบาๆ ก่อนนำไปใช้งานต่อ
