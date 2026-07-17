@@ -79,6 +79,23 @@ def get_person_mask(image_bgr, bg_dist_threshold=35):
     return diffs > bg_dist_threshold
 
 
+def apply_high_contrast(image_bgr, person_mask):
+    """แปลงภาพ (ที่ตัดพื้นหลังออกแล้ว) เป็นขาวดำ contrast สูงสุด: แปลงเป็น grayscale
+    แล้วยืดช่วงความสว่างของพิกเซล 'คน' เท่านั้นให้เต็มช่วง 0-255 (contrast stretching
+    โดยตัด percentile สุดขั้ว 1%/99% กัน outlier) เพื่อคัดแยกรายละเอียดผิว/เงาให้ชัดขึ้น
+    ก่อนนำไปใช้วิเคราะห์ Waist/Scapula ต่อ ส่วนพื้นหลังยังคงเป็นดำล้วนเหมือนเดิม"""
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    person_vals = gray[person_mask]
+    if person_vals.size == 0:
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    lo, hi = np.percentile(person_vals, [1, 99])
+    if hi <= lo:
+        hi = lo + 1.0
+    stretched = np.clip((gray.astype(np.float32) - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+    stretched[~person_mask] = 0  # พื้นหลังยังดำล้วน
+    return cv2.cvtColor(stretched, cv2.COLOR_GRAY2BGR)
+
+
 def _merge_close_runs(fg_row, max_bridge_gap):
     """รวมช่วง foreground ที่อยู่ใกล้กันมาก (ช่องว่างแคบกว่า max_bridge_gap)
     เพื่อไม่ให้เงาร่องกลางหลัง (เส้นกระดูกสันหลัง) มาตัดแบ่งลำตัวออกเป็นสองท่อนเท็จๆ
@@ -397,9 +414,12 @@ def analyze_standing(image_bgr):
         person_mask = get_person_mask(image_bgr)  # กันไว้เผื่อโมเดลไม่คืน mask มาให้ หรือ resize พลาด
 
     # ตัดพื้นหลังออกจริง: ทาสีส่วนที่ไม่ใช่คนให้เป็นดำล้วน โดยไม่เปลี่ยนขนาด/กรอบภาพ
-    # แล้วใช้ภาพนี้ (แทนภาพต้นฉบับ) ในการวิเคราะห์ Waist/Scapula ต่อ กันพื้นหลังปนเข้าไปแน่นอน
     bg_removed = image_bgr.copy()
     bg_removed[~person_mask] = 0
+
+    # แปลงเป็นขาวดำ contrast สูงสุด ต่อจากขั้นตัดพื้นหลังทันที (ก่อนใช้เป็นภาพหลักในการวิเคราะห์)
+    # เพื่อคัดแยกสีอื่นออก เหลือแต่รายละเอียดผิว/เงาที่เด่นชัดขึ้น แล้วใช้ภาพนี้วิเคราะห์ Waist/Scapula ต่อ
+    contrast_img = apply_high_contrast(bg_removed, person_mask)
 
     landmarks      = result.pose_landmarks[0]
     nose           = landmarks[0]
@@ -529,7 +549,7 @@ def analyze_standing(image_bgr):
     scapula_y_top = mid_shoulder_y + int(0.15 * back_span)
     scapula_y_bottom = mid_shoulder_y + int(SCAPULA_ZONE_FRAC * back_span)
     scapula_result = find_scapula_peaks(
-        bg_removed, annotated, scapula_y_top, scapula_y_bottom, mid_shoulder_x, w,
+        contrast_img, annotated, scapula_y_top, scapula_y_bottom, mid_shoulder_x, w,
         person_mask=person_mask, edge_margin_frac=0.20)
     if scapula_result and scapula_result.get("detected"):
         scapula_detected      = True
@@ -547,7 +567,7 @@ def analyze_standing(image_bgr):
     y_top, y_bottom = mid_shoulder_y, mid_hip_y  # ใช้ต่อสำหรับหา Waist
 
     # เอว: หาจากรูปทรงลำตัว ไม่พึ่งจุด landmark สะโพก จึงใช้ได้แม้ภาพตัดสูงกว่าสะโพก
-    waist_result = find_waist_points(bg_removed, y_top, y_bottom, person_mask=person_mask)
+    waist_result = find_waist_points(contrast_img, y_top, y_bottom, person_mask=person_mask)
     if waist_result:
         left_waist, right_waist = waist_result
         dx_wst = right_waist[0] - left_waist[0]
@@ -591,6 +611,7 @@ def analyze_standing(image_bgr):
         "waist_tilt_dir":       waist_tilt_dir,
         "person_mask":          person_mask,
         "bg_removed":           bg_removed,
+        "contrast_img":         contrast_img,
     }, annotated
 
 
@@ -747,25 +768,29 @@ else:
             st.error("ไม่พบร่างกายในภาพ กรุณาลองใหม่")
         else:
             with st.expander("🔍 ดูขั้นตอนการประมวลผล (Processing Steps)", expanded=False):
-                step1, step2, step3, step4 = st.columns(4)
+                step1, step2, step3, step4, step5 = st.columns(5)
                 with step1:
                     st.caption("1) ภาพต้นฉบับ")
                     st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
                 with step2:
-                    st.caption("2) ตัดพื้นหลังออกจริง (ใช้วิเคราะห์ต่อ)")
+                    st.caption("2) ตัดพื้นหลังออกจริง")
                     st.image(cv2.cvtColor(result["bg_removed"], cv2.COLOR_BGR2RGB), use_container_width=True)
                 with step3:
-                    st.caption("3) Person Mask (ขาว = คน, ดำ = พื้นหลัง)")
+                    st.caption("3) ขาวดำ Contrast สูงสุด (ใช้วิเคราะห์ต่อ)")
+                    st.image(cv2.cvtColor(result["contrast_img"], cv2.COLOR_BGR2RGB), use_container_width=True)
+                with step4:
+                    st.caption("4) Person Mask (ขาว = คน, ดำ = พื้นหลัง)")
                     mask_img = (result["person_mask"].astype(np.uint8) * 255)
                     st.image(mask_img, use_container_width=True)
-                with step4:
-                    st.caption("4) จุด Landmark + วิเคราะห์ (ผลลัพธ์สุดท้าย)")
+                with step5:
+                    st.caption("5) จุด Landmark + วิเคราะห์ (ผลลัพธ์สุดท้าย)")
                     st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
                 st.caption("ขั้นตอน: (1) รับภาพต้นฉบับ → (2) แยกคนออกจากพื้นหลังด้วย Segmentation Mask ของ MediaPipe "
                            "(โมเดล AI ที่เทรนมาแยกคนโดยเฉพาะ ไม่ใช่การเดาสี) แล้วทาสีพื้นหลังให้เป็นดำล้วนตาม mask "
-                           "โดยไม่เปลี่ยนขนาด/กรอบภาพ ได้ภาพตัดพื้นหลังนี้ไปใช้วิเคราะห์ Waist/Scapula ต่อ กันพื้นหลังปนเข้าไปแน่นอน → "
-                           "(3) mask ขาว-ดำที่ใช้สร้างภาพขั้นตอนที่ 2 (แสดงไว้ให้ตรวจสอบได้) → "
-                           "(4) รวมกับจุด Landmark จาก MediaPipe วิเคราะห์ Spine/Shoulder/Hip ต่อ")
+                           "โดยไม่เปลี่ยนขนาด/กรอบภาพ → (3) แปลงเป็นขาวดำแล้วยืด contrast เฉพาะบริเวณที่เป็นคนให้เต็มช่วง "
+                           "0-255 ทันทีหลังตัดพื้นหลัง คัดแยกรายละเอียดผิว/เงาให้ชัดขึ้น ได้ภาพนี้ไปใช้วิเคราะห์ Waist/Scapula ต่อ → "
+                           "(4) mask ขาว-ดำที่ใช้ตัดพื้นหลังในขั้นตอนที่ 2-3 (แสดงไว้ให้ตรวจสอบได้) → "
+                           "(5) รวมกับจุด Landmark จาก MediaPipe วิเคราะห์ Spine/Shoulder/Hip ต่อ")
 
             annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
             st.image(annotated_rgb,
