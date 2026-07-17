@@ -62,6 +62,21 @@ def estimate_bg_gradient(image_bgr):
     return top_bg, bot_bg
 
 
+def get_person_mask(image_bgr, bg_dist_threshold=35):
+    """ขั้นตอนก่อนประมวลผล: แปลงภาพเป็น mask ขาว-ดำ (คน=True, พื้นหลัง=False)
+    โดยเทียบสีแต่ละพิกเซลกับสีพื้นหลังที่ประมาณจาก 4 มุมภาพ (รองรับพื้นหลังไล่เฉด)
+    เพื่อคัดแยกส่วนที่เป็นคนออกจากสีอื่น/พื้นหลังให้ชัดเจนก่อน แล้วให้ทุกฟังก์ชัน
+    วิเคราะห์รูปทรง/ความสว่าง (Waist, Scapula) ใช้ mask เดียวกันนี้ร่วมกัน
+    แทนที่จะให้แต่ละฟังก์ชันไปประมาณพื้นหลังแยกกันเอง ลดความเสี่ยงพื้นหลังปนเข้าไปในผล"""
+    h, w, _ = image_bgr.shape
+    top_bg, bot_bg = estimate_bg_gradient(image_bgr)
+    y_idx = np.arange(h, dtype=np.float32).reshape(-1, 1)
+    t = y_idx / max(h - 1, 1)
+    bg_ref = top_bg.reshape(1, 3) * (1 - t) + bot_bg.reshape(1, 3) * t  # (h,3) ไล่เฉดแนวตั้ง
+    diffs = np.linalg.norm(image_bgr.astype(np.float32) - bg_ref[:, np.newaxis, :], axis=2)  # (h,w)
+    return diffs > bg_dist_threshold
+
+
 def _merge_close_runs(fg_row, max_bridge_gap):
     """รวมช่วง foreground ที่อยู่ใกล้กันมาก (ช่องว่างแคบกว่า max_bridge_gap)
     เพื่อไม่ให้เงาร่องกลางหลัง (เส้นกระดูกสันหลัง) มาตัดแบ่งลำตัวออกเป็นสองท่อนเท็จๆ
@@ -89,6 +104,7 @@ def _merge_close_runs(fg_row, max_bridge_gap):
 
 
 def find_waist_points(image_bgr, y_top, y_bottom,
+                       person_mask=None,
                        top_margin_frac=WAIST_TOP_MARGIN_FRAC,
                        bottom_margin_frac=WAIST_BOTTOM_MARGIN_FRAC,
                        bg_dist_threshold=WAIST_BG_DIST_THRESHOLD,
@@ -97,7 +113,8 @@ def find_waist_points(image_bgr, y_top, y_bottom,
                        bridge_gap_frac=0.015):
     """หาตำแหน่งจุด 'เอว' ซ้าย/ขวา จากรูปทรงลำตัว (silhouette) แทนที่จะพึ่งจุดสะโพก
     เหมาะกับภาพที่ถูก crop สูงกว่าสะโพก เพราะเอวมักยังติดอยู่ในเฟรม
-    คืนค่า (left_pt, right_pt) หรือ None ถ้าหาไม่ได้ชัดพอ"""
+    ใช้ person_mask ที่คำนวณไว้แล้วครั้งเดียว (จาก get_person_mask) ถ้ามีให้ แทนที่จะ
+    ประมาณพื้นหลังซ้ำเองต่อแถว คืนค่า (left_pt, right_pt) หรือ None ถ้าหาไม่ได้ชัดพอ"""
     h, w, _ = image_bgr.shape
     y_top = max(0, min(int(y_top), h - 1))
     y_bottom = max(0, min(int(y_bottom), h - 1))
@@ -110,17 +127,15 @@ def find_waist_points(image_bgr, y_top, y_bottom,
     if y_end <= y_start:
         return None
 
-    top_bg, bot_bg = estimate_bg_gradient(image_bgr)
+    if person_mask is None:
+        person_mask = get_person_mask(image_bgr, bg_dist_threshold)
+
     bridge_gap = max(4, int(w * bridge_gap_frac))
     min_width  = w * min_width_frac
     left_xs, right_xs = {}, {}
 
     for y in range(y_start, y_end):
-        t = y / max(h - 1, 1)
-        bg_ref = top_bg * (1 - t) + bot_bg * t  # รองรับพื้นหลังไล่เฉดแนวตั้ง
-        row = image_bgr[y].astype(np.float32)
-        diffs = np.linalg.norm(row - bg_ref, axis=1)
-        fg = diffs > bg_dist_threshold
+        fg = person_mask[y]
 
         runs = _merge_close_runs(fg, bridge_gap)
         if not runs:
@@ -253,12 +268,16 @@ def draw_spine_chain(img, points, dev_low_ratio=0.02, dev_high_ratio=0.05):
 
 
 def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w,
-                        edge_margin_frac=0.12, min_significance=1.5):
+                        person_mask=None, edge_margin_frac=0.12, min_significance=1.5):
     """หาจุดที่สะบักนูนที่สุดของแต่ละฝั่ง 'แยกกันอิสระ' โดยลบแนวโน้มการไล่แสง
     (ผิวหลังสว่างไล่ระดับจากไหล่ลงเอวตามธรรมชาติ) ด้วยวิธี linear detrend
     (fit เส้นตรงเข้ากับสัญญาณความสว่างแล้วลบออก) ซึ่งไม่มีปัญหา edge bias
     แบบ moving-average ที่เคยลองมาก่อน แล้วตัดขอบบน-ล่างออกจากการค้นหาจุดพีค
     (กันจุดหลอกที่ขอบ) เหลือแต่ส่วนที่ 'นูนกว่าแนวโน้มรอบข้าง' จริงๆ
+
+    ใช้ person_mask (จาก get_person_mask) เพื่อเฉลี่ยความสว่างเฉพาะพิกเซลที่เป็น
+    'คน' ต่อแถวเท่านั้น กันพื้นหลังที่หลุดเข้ามาในกรอบ (เช่น ใกล้รักแร้/ขอบแขน)
+    ปนเข้าไปในค่าความสว่างจนสัญญาณเพี้ยน
 
     ก่อนเชื่อผลจะเช็คว่าจุดพีคที่เจอ 'โดดเด่นกว่าสัญญาณรบกวนทั่วไป' มากพอไหม
     (peak detail ต้องเกิน min_significance เท่าของค่า SD ของสัญญาณทั้งเส้น)
@@ -274,12 +293,25 @@ def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w,
         return None
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY).astype(np.float32)
     cx = min(x_center, w_r - 1)
-    left_gray, right_gray = gray[:, :cx], gray[:, cx:]
+
+    if person_mask is None:
+        person_mask = get_person_mask(image_bgr)
+    mask_region = person_mask[y_top:y_bottom, :]
+
+    left_gray,  right_gray  = gray[:, :cx],        gray[:, cx:]
+    left_mask,  right_mask  = mask_region[:, :cx], mask_region[:, cx:]
     if left_gray.shape[1] < 5 or right_gray.shape[1] < 5:
         return None
 
-    def detrended_peak(profile_2d):
-        profile = profile_2d.mean(axis=1)  # ความสว่างเฉลี่ยต่อแถว
+    def detrended_peak(profile_2d, mask_2d):
+        # เฉลี่ยความสว่างเฉพาะพิกเซล 'คน' ต่อแถว (กันพื้นหลังปนเข้ามา)
+        counts = mask_2d.sum(axis=1)
+        sums = np.where(mask_2d, profile_2d, 0.0).sum(axis=1)
+        counts_safe = np.where(counts > 0, counts, 1)
+        profile = sums / counts_safe
+        fallback = profile_2d.mean(axis=1)  # แถวที่ไม่มีพิกเซล 'คน' เลย ใช้ค่าเฉลี่ยทั้งแถวกัน error
+        profile = np.where(counts > 0, profile, fallback)
+
         n = len(profile)
         x = np.arange(n)
         coeffs = np.polyfit(x, profile, deg=1)  # fit เส้นตรง = แนวโน้มการไล่แสงรวม
@@ -294,8 +326,8 @@ def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w,
         significance = float(detail[peak_row]) / noise_sd
         return peak_row, float(profile[peak_row]), significance
 
-    left_peak_row,  left_peak_val,  left_sig  = detrended_peak(left_gray)
-    right_peak_row, right_peak_val, right_sig = detrended_peak(right_gray)
+    left_peak_row,  left_peak_val,  left_sig  = detrended_peak(left_gray, left_mask)
+    right_peak_row, right_peak_val, right_sig = detrended_peak(right_gray, right_mask)
 
     # ต้องมีตุ่มนูนที่ชัดเจนจริงทั้งสองฝั่ง ถึงจะเทียบกันได้อย่างมีความหมาย
     if left_sig < min_significance or right_sig < min_significance:
@@ -328,6 +360,11 @@ def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w,
 
 def analyze_standing(image_bgr):
     h, w, _ = image_bgr.shape
+
+    # ขั้นตอนก่อนวิเคราะห์: แปลงภาพเป็น mask ขาว-ดำ (คน=พื้นหลัง) ครั้งเดียว
+    # ใช้ร่วมกันทั้ง Waist และ Scapula detection แทนที่จะให้แต่ละจุดไปประมาณเอง
+    person_mask = get_person_mask(image_bgr)
+
     rgb_image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
     result    = detector.detect(mp_image)
@@ -464,7 +501,7 @@ def analyze_standing(image_bgr):
     scapula_y_bottom = mid_shoulder_y + int(SCAPULA_ZONE_FRAC * back_span)
     scapula_result = find_scapula_peaks(
         image_bgr, annotated, scapula_y_top, scapula_y_bottom, mid_shoulder_x, w,
-        edge_margin_frac=0.20)
+        person_mask=person_mask, edge_margin_frac=0.20)
     if scapula_result and scapula_result.get("detected"):
         scapula_detected      = True
         scapula_diff          = scapula_result["prominence_diff"]
@@ -481,7 +518,7 @@ def analyze_standing(image_bgr):
     y_top, y_bottom = mid_shoulder_y, mid_hip_y  # ใช้ต่อสำหรับหา Waist
 
     # เอว: หาจากรูปทรงลำตัว ไม่พึ่งจุด landmark สะโพก จึงใช้ได้แม้ภาพตัดสูงกว่าสะโพก
-    waist_result = find_waist_points(image_bgr, y_top, y_bottom)
+    waist_result = find_waist_points(image_bgr, y_top, y_bottom, person_mask=person_mask)
     if waist_result:
         left_waist, right_waist = waist_result
         dx_wst = right_waist[0] - left_waist[0]
