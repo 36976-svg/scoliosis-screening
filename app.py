@@ -446,11 +446,14 @@ def analyze_standing(image_bgr):
     spine_info = draw_spine_chain(annotated, spine_points)
 
     # Scapula: หาจุดนูนสุดของสะบักแต่ละฝั่งแยกกัน (ปรับตามตำแหน่งจริง ไม่ใช่กล่องนิ่ง)
-    # ขยายโซนถึง ~45% ของช่วงไหล่-เอว ให้มีที่ว่างพอให้จุดพีคขยับตามความสูง-ต่ำได้จริง
-    scapula_y_top = mid_shoulder_y
-    scapula_y_bottom = mid_shoulder_y + int(SCAPULA_ZONE_FRAC * (mid_hip_y - mid_shoulder_y))
+    # ข้ามช่วงคอ-บ่า (trapezius) ที่โค้งมนสว่างจ้าก่อน ไม่งั้นจะไปเจอ 'ตุ่มปลอม' ตรงนั้น
+    # แทนที่จะเป็นตัวสะบักจริงที่อยู่ต่ำลงมา แล้วขยายโซนถึง ~45% ของช่วงไหล่-เอว
+    back_span = mid_hip_y - mid_shoulder_y
+    scapula_y_top = mid_shoulder_y + int(0.15 * back_span)
+    scapula_y_bottom = mid_shoulder_y + int(SCAPULA_ZONE_FRAC * back_span)
     scapula_result = find_scapula_peaks(
-        image_bgr, annotated, scapula_y_top, scapula_y_bottom, mid_shoulder_x, w)
+        image_bgr, annotated, scapula_y_top, scapula_y_bottom, mid_shoulder_x, w,
+        edge_margin_frac=0.20)
     if scapula_result:
         scapula_diff          = scapula_result["prominence_diff"]
         scapula_side          = scapula_result["prominent_side"]
