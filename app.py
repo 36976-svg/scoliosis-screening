@@ -223,10 +223,8 @@ def find_waist_points(image_bgr, y_top, y_bottom,
     if y_end <= y_start:
         return None
 
-    if person_mask is None:
-        person_mask = get_person_mask(image_bgr, bg_dist_threshold)
-    if person_mask.ndim != 2 or person_mask.shape != (h, w):
-        person_mask = get_person_mask(image_bgr, bg_dist_threshold)  # กันขนาดไม่ตรง ใช้ heuristic แทน
+    if person_mask is None or person_mask.ndim != 2 or person_mask.shape != (h, w):
+        person_mask = np.ones((h, w), dtype=bool)
 
     bridge_gap = max(4, int(w * bridge_gap_frac))
     min_width  = w * min_width_frac
@@ -394,11 +392,7 @@ def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w,
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY).astype(np.float32)
     cx = min(x_center, w_r - 1)
 
-    if person_mask is None:
-        person_mask = get_person_mask(image_bgr)
-    if person_mask.ndim != 2 or person_mask.shape != image_bgr.shape[:2]:
-        # กันเผื่อ mask ที่ส่งเข้ามาขนาดไม่ตรงกับภาพ (ไม่ควรเกิดถ้า resize ไว้ถูกต้องแล้ว
-        # แต่กันไว้อีกชั้นไม่ให้แอปพัง) — ถือว่าทุกพิกเซลเป็นคนไปเลยแทน
+    if person_mask is None or person_mask.ndim != 2 or person_mask.shape != image_bgr.shape[:2]:
         mask_region = np.ones((h_r, w_r), dtype=bool)
     else:
         mask_region = person_mask[y_top:y_bottom, :]
@@ -486,18 +480,9 @@ def analyze_standing(image_bgr):
         except Exception:
             person_mask = None
     if person_mask is None:
-        person_mask = get_person_mask(image_bgr)  # กันไว้เผื่อโมเดลไม่คืน mask มาให้ หรือ resize พลาด
-
-    # เช็คความน่าเชื่อถือของ mask ด้วยจุด landmark ที่รู้แน่นอนแล้วว่าเป็นร่างกายจริง
-    # (ไหล่ซ้าย-ขวา) ถ้า mask พลาดร้ายแรง (เช่น หายไปครึ่งซีก) ให้เลิกใช้ segmentation mask
-    # แล้ว fallback ไปใช้ heuristic เทียบสีพื้นหลังแทน
-    lm0 = result.pose_landmarks[0]
-    check_points_px = [
-        (int(lm0[11].x * w), int(lm0[11].y * h)),  # left_shoulder
-        (int(lm0[12].x * w), int(lm0[12].y * h)),  # right_shoulder
-    ]
-    if not mask_covers_landmarks(person_mask, check_points_px):
-        person_mask = get_person_mask(image_bgr)  # segmentation mask ผิดพลาด fallback ไป heuristic
+        # ถ้าไม่มี segmentation mask จาก MediaPipe ให้ถือว่าทุกพิกเซลเป็นคนไปก่อน
+        # (ไม่ใช้ heuristic เดาสีพื้นหลัง เพราะเดาผิดทำให้ฝั่งใดฝั่งหนึ่งกลายเป็นสีดำ)
+        person_mask = np.ones((h, w), dtype=bool)
 
     # ลบส่วนที่ mask อาจเชื่อมติดกันผิดพลาด (เช่น ช่องว่างใต้รักแร้ระหว่างแขน-ลำตัว)
     # ด้วย erosion เบาๆ ก่อนนำไปใช้งานต่อ
@@ -879,8 +864,10 @@ else:
                     st.image(cv2.cvtColor(result["contrast_img"], cv2.COLOR_BGR2RGB), use_container_width=True)
                 with step4:
                     st.caption("4) Person Mask (ขาว = คน, ดำ = พื้นหลัง)")
-                    mask_img = (result["person_mask"].astype(np.uint8) * 255)
-                    st.image(mask_img, use_container_width=True)
+                    # สร้างภาพ mask ที่คนเป็นสีขาวล้วน พื้นหลังสีดำล้วน เต็มตัว
+                    mask_vis = np.zeros_like(image_bgr)
+                    mask_vis[result["person_mask"]] = 255
+                    st.image(mask_vis, use_container_width=True)
                 with step5:
                     st.caption("5) จุด Landmark + วิเคราะห์ (ผลลัพธ์สุดท้าย)")
                     st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
