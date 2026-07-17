@@ -752,18 +752,19 @@ else:
                     st.caption("1) ภาพต้นฉบับ")
                     st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
                 with step2:
-                    st.caption("2) Person Mask (ขาว = คน, ดำ = พื้นหลัง)")
+                    st.caption("2) ตัดพื้นหลังออกจริง (ใช้วิเคราะห์ต่อ)")
+                    st.image(cv2.cvtColor(result["bg_removed"], cv2.COLOR_BGR2RGB), use_container_width=True)
+                with step3:
+                    st.caption("3) Person Mask (ขาว = คน, ดำ = พื้นหลัง)")
                     mask_img = (result["person_mask"].astype(np.uint8) * 255)
                     st.image(mask_img, use_container_width=True)
-                with step3:
-                    st.caption("3) ตัดพื้นหลังออกจริง (ใช้วิเคราะห์ต่อ)")
-                    st.image(cv2.cvtColor(result["bg_removed"], cv2.COLOR_BGR2RGB), use_container_width=True)
                 with step4:
                     st.caption("4) จุด Landmark + วิเคราะห์ (ผลลัพธ์สุดท้าย)")
                     st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
                 st.caption("ขั้นตอน: (1) รับภาพต้นฉบับ → (2) แยกคนออกจากพื้นหลังด้วย Segmentation Mask ของ MediaPipe "
-                           "(โมเดล AI ที่เทรนมาแยกคนโดยเฉพาะ ไม่ใช่การเดาสี) → (3) ทาสีพื้นหลังให้เป็นดำล้วนตาม mask "
-                           "โดยไม่เปลี่ยนขนาด/กรอบภาพ แล้วใช้ภาพนี้วิเคราะห์ Waist/Scapula ต่อ กันพื้นหลังปนเข้าไปแน่นอน → "
+                           "(โมเดล AI ที่เทรนมาแยกคนโดยเฉพาะ ไม่ใช่การเดาสี) แล้วทาสีพื้นหลังให้เป็นดำล้วนตาม mask "
+                           "โดยไม่เปลี่ยนขนาด/กรอบภาพ ได้ภาพตัดพื้นหลังนี้ไปใช้วิเคราะห์ Waist/Scapula ต่อ กันพื้นหลังปนเข้าไปแน่นอน → "
+                           "(3) mask ขาว-ดำที่ใช้สร้างภาพขั้นตอนที่ 2 (แสดงไว้ให้ตรวจสอบได้) → "
                            "(4) รวมกับจุด Landmark จาก MediaPipe วิเคราะห์ Spine/Shoulder/Hip ต่อ")
 
             annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
