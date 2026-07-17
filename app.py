@@ -49,6 +49,7 @@ WAIST_BG_DIST_THRESHOLD  = 35   # ค่าความต่างสี (BGR) 
 WAIST_TOP_MARGIN_FRAC    = 0.15  # ตัดขอบบนออก (ใกล้รักแร้/ไหล่ ยังไม่ใช่เอว)
 WAIST_BOTTOM_MARGIN_FRAC = 0.12  # ตัดขอบล่างออก (กันขอบกางเกง/ชุดชั้นในกวนผล)
 WAIST_MIN_VALID_ROWS     = 15    # ต้องมีแถวที่หาลำตัวเจอมากพอ ไม่งั้นถือว่าตรวจไม่ได้
+WAIST_MAX_HEIGHT_DIFF_RATIO = 0.35  # จุดเอวซ้าย-ขวาต้องอยู่ระดับใกล้เคียงกัน เกินนี้ถือว่าจุดหลุด/สิ่งรบกวน
 
 
 def estimate_bg_gradient(image_bgr):
@@ -202,6 +203,12 @@ def find_waist_points(image_bgr, y_top, y_bottom,
     left_waist_y  = max(left_xs, key=lambda y: left_xs[y])
     # จุดเอวฝั่งขวา = แถวที่ขอบขวาเว้าเข้ามาทางซ้ายสุด (x น้อยสุด)
     right_waist_y = min(right_xs, key=lambda y: right_xs[y])
+
+    # เช็คความสมเหตุสมผล: เอวจริงของคนสองข้างควรอยู่ระดับใกล้เคียงกัน ถ้าต่างกันเยอะเกินไป
+    # (เช่น คนรูปร่างไม่มีเอวคอดชัด ทำให้จุด 'เว้าที่สุด' หลุดไปเจอสิ่งรบกวนแทน) ถือว่าไม่น่าเชื่อถือ
+    height_diff_ratio = abs(left_waist_y - right_waist_y) / span
+    if height_diff_ratio > WAIST_MAX_HEIGHT_DIFF_RATIO:
+        return None
 
     left_pt  = (float(left_xs[left_waist_y]),   float(left_waist_y))
     right_pt = (float(right_xs[right_waist_y]), float(right_waist_y))
