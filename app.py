@@ -486,9 +486,9 @@ def analyze_standing(image_bgr):
 
     # ขยาย mask ออกก่อนเพื่อให้ครอบคลุมขอบร่างกายได้สมบูรณ์ขึ้น
     # (segmentation mask ของ MediaPipe บางครั้งครอบคลุมไม่ถึงขอบจริง ทำให้พื้นหลังขอบๆ หลุดเข้ามา)
-    kernel_dilate = np.ones((15, 15), np.uint8)
+        kernel_dilate = np.ones((30, 30), np.uint8)
     person_mask_u8 = person_mask.astype(np.uint8) * 255
-    person_mask_u8 = cv2.dilate(person_mask_u8, kernel_dilate, iterations=2)
+    person_mask_u8 = cv2.dilate(person_mask_u8, kernel_dilate, iterations=3)
 
     # ลบส่วนที่ mask อาจเชื่อมติดกันผิดพลาด (เช่น ช่องว่างใต้รักแร้ระหว่างแขน-ลำตัว)
     # ด้วย erosion เบาๆ ก่อนนำไปใช้งานต่อ
