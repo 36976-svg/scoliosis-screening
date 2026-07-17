@@ -489,13 +489,6 @@ def analyze_standing(image_bgr):
     kernel_dilate = np.ones((15, 15), np.uint8)
     person_mask_u8 = person_mask.astype(np.uint8) * 255
     person_mask_u8 = cv2.dilate(person_mask_u8, kernel_dilate, iterations=2)
-    # เติมรูโหว่ภายใน mask ด้วย flood fill จากมุมภาพ
-    ff = person_mask_u8.copy()
-    ff_mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(ff, ff_mask, (0, 0), 255)
-    ff_inv = cv2.bitwise_not(ff)
-    person_mask_u8 = person_mask_u8 | ff_inv
-    person_mask = person_mask_u8 > 0
 
     # ลบส่วนที่ mask อาจเชื่อมติดกันผิดพลาด (เช่น ช่องว่างใต้รักแร้ระหว่างแขน-ลำตัว)
     # ด้วย erosion เบาๆ ก่อนนำไปใช้งานต่อ
