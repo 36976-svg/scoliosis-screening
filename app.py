@@ -11,9 +11,9 @@ import urllib.request
 
 st.set_page_config(page_title="ระบบคัดกรองภาวะกระดูกสันหลังคดเบื้องต้น", layout="centered")
 
-BASELINE_FILE = "baseline.json"
-MODEL_FILE = "pose_landmarker_heavy.task"
-MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"
+BASELINE_FILE  = "baseline.json"
+MODEL_FILE     = "pose_landmarker_heavy.task"
+MODEL_URL      = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"
 
 def download_model():
     if not os.path.exists(MODEL_FILE):
@@ -28,995 +28,625 @@ def load_detector():
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.IMAGE,
-        output_segmentation_masks=True,  # ใช้โมเดล AI ของ MediaPipe แยกคนออกจากพื้นหลัง
-                                          # แทนการเดาสีพื้นหลังเอง รองรับพื้นหลังซับซ้อนได้จริง
-        min_pose_detection_confidence=0.6,  # เข้มงวดขึ้นจาก default 0.5 กันจุดที่โมเดลไม่มั่นใจพอ
-        min_pose_presence_confidence=0.6,
+        output_segmentation_masks=True,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
     )
     return vision.PoseLandmarker.create_from_options(options)
 
 detector = load_detector()
 
-HIP_VISIBILITY_THRESHOLD = 0.5  # ต่ำกว่านี้ถือว่าสะโพกไม่ได้อยู่ในเฟรม/โมเดลไม่มั่นใจ ไม่นำมาใช้คำนวณ
-HIP_SLOPE_MAX_PLAUSIBLE = 0.35  # ~19 องศา ถือว่าสุดขั้วมากแล้วสำหรับสะโพกคนยืนตรง เกินนี้ = จุดหลุดแน่ๆ
-HIP_WIDTH_MIN_RATIO     = 0.5   # เส้นสะโพกต้องกว้างอย่างน้อยครึ่งหนึ่งของเส้นไหล่ ไม่งั้นถือว่าจุดหลุด
-SCAPULA_ZONE_FRAC = 0.45  # สัดส่วนช่วงไหล่-เอวที่นับเป็นโซนสะบัก (นับจากใต้ไหล่ลงมา)
+# ─── ค่าคงที่ ───────────────────────────────────────────────────────────────
+HIP_VISIBILITY_THRESHOLD  = 0.4
+HIP_SLOPE_MAX_PLAUSIBLE   = 0.35
+HIP_WIDTH_MIN_RATIO       = 0.45
+SLOPE_LOW, SLOPE_HIGH     = 0.05, 0.15
+SPINE_DEV_LOW, SPINE_DEV_HIGH         = 0.02, 0.05
+SCAPULA_DIFF_LOW, SCAPULA_DIFF_HIGH   = 6.0, 15.0
+SCAPULA_HEIGHT_LOW, SCAPULA_HEIGHT_HIGH = 0.20, 0.40
 
-# ---------- การหา "เอว" แบบไม่พึ่งจุด landmark สะโพก ----------
-# ใช้การเปรียบเทียบสีของแต่ละพิกเซลกับสีพื้นหลังในแถวเดียวกัน (รองรับพื้นหลังไล่เฉด)
-# แล้วหาจุดที่ขอบลำตัวซ้าย/ขวาเว้าเข้ามากที่สุด (จุดคอดที่สุดของเอว) แยกกันแต่ละฝั่ง
-WAIST_BG_DIST_THRESHOLD  = 35   # ค่าความต่างสี (BGR) ขั้นต่ำที่ถือว่าเป็น "ลำตัว" ไม่ใช่พื้นหลัง
-WAIST_TOP_MARGIN_FRAC    = 0.15  # ตัดขอบบนออก (ใกล้รักแร้/ไหล่ ยังไม่ใช่เอว)
-WAIST_BOTTOM_MARGIN_FRAC = 0.12  # ตัดขอบล่างออก (กันขอบกางเกง/ชุดชั้นในกวนผล)
-WAIST_MIN_VALID_ROWS     = 15    # ต้องมีแถวที่หาลำตัวเจอมากพอ ไม่งั้นถือว่าตรวจไม่ได้
-WAIST_MAX_HEIGHT_DIFF_RATIO = 0.15  # จุดเอวซ้าย-ขวาต้องอยู่ระดับใกล้เคียงกัน เกินนี้ถือว่าจุดหลุด/สิ่งรบกวน
+# ─── helpers ──────────────────────────────────────────────────────────────────
 
-
-def estimate_bg_gradient(image_bgr):
-    """ประมาณสีพื้นหลังจาก 4 มุมภาพ (ซึ่งเป็นพื้นหลังแน่นอนเสมอในภาพถ่ายลักษณะนี้)
-    แล้วทำ interpolation แนวตั้งเพื่อรองรับพื้นหลังไล่เฉด โดยไม่เสี่ยงปนเปื้อนจาก
-    ตัวแบบ (ต่างจากการ sample ขอบซ้าย-ขวาของแต่ละแถวที่อาจโดนแขนบังได้ในบางภาพ)"""
-    h, w, _ = image_bgr.shape
-    patch = max(4, int(min(h, w) * 0.04))
-    tl = image_bgr[0:patch, 0:patch].reshape(-1, 3)
-    tr = image_bgr[0:patch, w - patch:w].reshape(-1, 3)
-    bl = image_bgr[h - patch:h, 0:patch].reshape(-1, 3)
-    br = image_bgr[h - patch:h, w - patch:w].reshape(-1, 3)
-    top_bg = np.median(np.vstack([tl, tr]), axis=0)
-    bot_bg = np.median(np.vstack([bl, br]), axis=0)
-    return top_bg, bot_bg
-
-
-def get_person_mask(image_bgr, bg_dist_threshold=35):
-    """ขั้นตอนก่อนประมวลผล: แปลงภาพเป็น mask ขาว-ดำ (คน=True, พื้นหลัง=False)
-    โดยเทียบสีแต่ละพิกเซลกับสีพื้นหลังที่ประมาณจาก 4 มุมภาพ (รองรับพื้นหลังไล่เฉด)
-    เพื่อคัดแยกส่วนที่เป็นคนออกจากสีอื่น/พื้นหลังให้ชัดเจนก่อน แล้วให้ทุกฟังก์ชัน
-    วิเคราะห์รูปทรง/ความสว่าง (Waist, Scapula) ใช้ mask เดียวกันนี้ร่วมกัน
-    แทนที่จะให้แต่ละฟังก์ชันไปประมาณพื้นหลังแยกกันเอง ลดความเสี่ยงพื้นหลังปนเข้าไปในผล"""
-    h, w, _ = image_bgr.shape
-    top_bg, bot_bg = estimate_bg_gradient(image_bgr)
-    y_idx = np.arange(h, dtype=np.float32).reshape(-1, 1)
-    t = y_idx / max(h - 1, 1)
-    bg_ref = top_bg.reshape(1, 3) * (1 - t) + bot_bg.reshape(1, 3) * t  # (h,3) ไล่เฉดแนวตั้ง
-    diffs = np.linalg.norm(image_bgr.astype(np.float32) - bg_ref[:, np.newaxis, :], axis=2)  # (h,w)
-    return diffs > bg_dist_threshold
+def get_clean_mask(result, h, w):
+    """สร้าง person mask จาก MediaPipe segmentation mask
+    — ใช้เฉพาะเพื่อแสดงใน Processing Steps เท่านั้น ไม่ใช้วิเคราะห์ต่อ"""
+    if not result.segmentation_masks:
+        return np.ones((h, w), dtype=bool)
+    try:
+        seg = np.asarray(result.segmentation_masks[0].numpy_view())
+        if seg.ndim == 3:
+            seg = seg[:, :, 0]
+        if seg.shape != (h, w):
+            seg = cv2.resize(seg, (w, h), interpolation=cv2.INTER_LINEAR)
+        mask = (seg > 0.5)
+        # ขยาย + เติมรูโหว่ เพื่อให้ภาพใน step 2-4 สวยงาม
+        m8 = mask.astype(np.uint8) * 255
+        m8 = cv2.dilate(m8, np.ones((20, 20), np.uint8), iterations=2)
+        ff = m8.copy()
+        cv2.floodFill(ff, np.zeros((h+2, w+2), np.uint8), (0, 0), 128)
+        m8[ff == 0] = 255
+        return m8 > 0
+    except Exception:
+        return np.ones((h, w), dtype=bool)
 
 
-def fill_mask_holes(person_mask):
-    """เติมรูโหว่ภายใน mask (เช่น จุดที่โมเดล segmentation เข้าใจผิดว่าเป็นพื้นหลัง
-    เพราะเงา/ไฝ/แสงตกกระทบผิวหนังจนดูสีต่างจากผิวรอบข้าง) ด้วยเทคนิค flood-fill
-    จากมุมภาพ (ซึ่งเป็นพื้นหลังแน่นอนเสมอ) พื้นที่ใดที่ flood-fill จากพื้นหลังไปไม่ถึง
-    แต่ไม่ใช่คนเดิม = รูโหว่ภายในลำตัว ให้เติมเป็นคนแทน กันรูโหว่ไปรบกวนการวัด
-    ความสว่าง/รูปทรงของ Waist และ Scapula"""
-    mask_u8 = person_mask.astype(np.uint8) * 255
-    h, w = mask_u8.shape
-    ff = mask_u8.copy()
-    ff_mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(ff, ff_mask, (0, 0), 255)
-    ff_inv = cv2.bitwise_not(ff)
-    filled = mask_u8 | ff_inv
-    return filled > 0
+def draw_dashed_line(img, y, x0, x1, color=(200, 200, 200), thickness=1):
+    for x in range(x0, x1, 20):
+        cv2.line(img, (x, y), (min(x+10, x1), y), color, thickness)
 
 
-def mask_covers_landmarks(person_mask, points_px, radius_frac=0.02):
-    """เช็คว่า mask ที่ได้มาครอบคลุมตำแหน่งจุด landmark ที่รู้อยู่แล้วว่าเป็นร่างกายจริง
-    (เช่น จุดไหล่ซ้าย-ขวาจาก Pose) หรือไม่ ถ้า mask บอกว่าตรงจุดนั้น 'ไม่ใช่คน' ทั้งที่
-    Pose landmark ยืนยันแล้วว่าเป็นไหล่จริง แปลว่า mask ผิดพลาดร้ายแรง (เช่น หายไปครึ่งซีก)
-    ควรเลิกเชื่อ mask นั้นแล้ว fallback ไปใช้วิธีอื่นแทน"""
-    h, w = person_mask.shape
-    radius = max(3, int(min(h, w) * radius_frac))
-    for (px, py) in points_px:
-        x0, x1 = max(0, px - radius), min(w, px + radius + 1)
-        y0, y1 = max(0, py - radius), min(h, py + radius + 1)
-        patch = person_mask[y0:y1, x0:x1]
-        if patch.size == 0 or patch.mean() < 0.5:
-            return False
-    return True
+def draw_zone_label(img, label, y_mid, color_bg, x_start, w_label=130):
+    x_start = max(0, min(x_start, img.shape[1] - w_label - 2))
+    cv2.rectangle(img, (x_start, y_mid-14), (x_start+w_label, y_mid+14), color_bg, -1)
+    cv2.rectangle(img, (x_start, y_mid-14), (x_start+w_label, y_mid+14), (255,255,255), 1)
+    cv2.putText(img, label, (x_start+5, y_mid+5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255,255,255), 1, cv2.LINE_AA)
 
 
-def refine_person_mask(person_mask, erosion_frac=0.004):
-    """โมเดล AI segmentation ของ MediaPipe บางทีทำให้ช่องว่างแคบๆ ระหว่างแขนกับลำตัว
-    (เช่น ใต้รักแร้) เรียบจนเชื่อมติดกันผิดพลาด (ต่างจากการเทียบสีดิบที่เห็นช่องว่างจริง)
-    และบางทีก็เผลอเจาะรูโหว่ผิดๆ กลางลำตัว (เช่น จุดที่มีเงา/ไฝ) จึงทำ 2 ขั้นตอน:
-    (1) เติมรูโหว่ภายในก่อน (2) ค่อยใช้ morphological erosion เบาๆ 'แทะ' ขอบออก
-    เพื่อพยายามเปิดช่องว่างแคบๆ ที่ควรมีอยู่จริงกลับมา โดยไม่กระทบรูปทรงโดยรวมมากเกินไป
-    (erosion ช่วยได้เฉพาะช่องว่างที่แคบมากๆ ถ้าโมเดลเชื่อมกว้างเกินไปวิธีนี้จะช่วยไม่ได้ทั้งหมด)"""
-    person_mask = fill_mask_holes(person_mask)
-    h, w = person_mask.shape
-    k = max(1, int(min(h, w) * erosion_frac))
-    if k < 2:
-        return person_mask
-    kernel = np.ones((k, k), np.uint8)
-    eroded = cv2.erode(person_mask.astype(np.uint8), kernel, iterations=1)
-    return eroded.astype(bool)
-
-
-def apply_high_contrast(image_bgr, person_mask):
-    """แปลงภาพ (ที่ตัดพื้นหลังออกแล้ว) เป็นขาวดำ contrast สูงสุด: แปลงเป็น grayscale
-    แล้วยืดช่วงความสว่างของพิกเซล 'คน' เท่านั้นให้เต็มช่วง 0-255 (contrast stretching
-    โดยตัด percentile สุดขั้ว 1%/99% กัน outlier) เพื่อคัดแยกรายละเอียดผิว/เงาให้ชัดขึ้น
-    ก่อนนำไปใช้วิเคราะห์ Waist/Scapula ต่อ ส่วนพื้นหลังยังคงเป็นดำล้วนเหมือนเดิม"""
+def apply_high_contrast(image_bgr, mask):
+    """ขาวดำ contrast สูงเฉพาะส่วนคน"""
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    person_vals = gray[person_mask]
-    if person_vals.size == 0:
+    vals = gray[mask]
+    if vals.size == 0:
         return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    lo, hi = np.percentile(person_vals, [1, 99])
-    if hi <= lo:
-        hi = lo + 1.0
-    stretched = np.clip((gray.astype(np.float32) - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
-    stretched[~person_mask] = 0  # พื้นหลังยังดำล้วน
-    return cv2.cvtColor(stretched, cv2.COLOR_GRAY2BGR)
+    lo, hi = np.percentile(vals, [1, 99])
+    if hi <= lo: hi = lo + 1
+    s = np.clip((gray.astype(np.float32)-lo)/(hi-lo)*255, 0, 255).astype(np.uint8)
+    s[~mask] = 0
+    return cv2.cvtColor(s, cv2.COLOR_GRAY2BGR)
 
 
-def check_arms_natural(left_shoulder, left_elbow, right_shoulder, right_elbow, w, h, max_angle_deg=40):
-    """ใช้จุดศอก (landmark 13, 14) เช็คว่าแขนห้อยลงข้างลำตัวตามธรรมชาติจริงไหม
-    (ไม่ใช่ยกแขน/กางแขน/เอามือเท้าเอว) เพราะท่าแขนผิดปกติจะทำให้รูปทรงลำตัวที่เห็น
-    ในภาพเพี้ยนไป กระทบความแม่นยำของ Waist/Scapula ที่วัดจากรูปทรงลำตัวโดยตรง
-    วัดมุมของเวกเตอร์ไหล่→ศอก เทียบกับแนวดิ่ง ถ้าเกิน max_angle_deg ถือว่าผิดธรรมชาติ
-    คืนค่า (arms_natural: bool, sides_warned: list ของ 'ซ้าย'/'ขวา' ที่ผิดปกติ)"""
-    def arm_angle_deg(shoulder, elbow):
-        dx = (elbow.x - shoulder.x) * w
-        dy = (elbow.y - shoulder.y) * h
-        if dy <= 0:  # ศอกอยู่สูงกว่าหรือเท่ากับไหล่ = ยกแขนขึ้นชัดเจน ผิดธรรมชาติแน่นอน
-            return 90.0
-        return math.degrees(math.atan2(abs(dx), dy))
-
-    left_angle  = arm_angle_deg(left_shoulder, left_elbow)
-    right_angle = arm_angle_deg(right_shoulder, right_elbow)
-
-    sides_warned = []
-    if left_angle > max_angle_deg:
-        sides_warned.append("ซ้าย")
-    if right_angle > max_angle_deg:
-        sides_warned.append("ขวา")
-
-    return len(sides_warned) == 0, sides_warned
+def estimate_neck(nose, left_ear, right_ear, mid_sx, mid_sy, w, h):
+    mx = (left_ear.x + right_ear.x)/2 * w
+    my = (left_ear.y + right_ear.y)/2 * h
+    return mx + 0.28*(mid_sx-mx), my + 0.28*(mid_sy-my)
 
 
-def _merge_close_runs(fg_row, max_bridge_gap):
-    """รวมช่วง foreground ที่อยู่ใกล้กันมาก (ช่องว่างแคบกว่า max_bridge_gap)
-    เพื่อไม่ให้เงาร่องกลางหลัง (เส้นกระดูกสันหลัง) มาตัดแบ่งลำตัวออกเป็นสองท่อนเท็จๆ
-    แต่ยังคงแยกลำตัวออกจากแขนได้ ถ้าช่องว่างระหว่างกันกว้างกว่านี้จริง (เช่น ช่องรักแร้)"""
-    runs = []
-    x, n = 0, len(fg_row)
-    while x < n:
-        if fg_row[x]:
-            start = x
-            while x < n and fg_row[x]:
-                x += 1
-            runs.append([start, x - 1])
-        else:
-            x += 1
-    if not runs:
-        return []
-    merged = [runs[0]]
-    for r in runs[1:]:
-        gap = r[0] - merged[-1][1] - 1
-        if gap <= max_bridge_gap:
-            merged[-1][1] = r[1]
-        else:
-            merged.append(r)
-    return merged
+def build_spine_chain(neck, mid_sh, mid_hip, n=3):
+    pts = [neck, mid_sh]
+    for i in range(1, n+1):
+        t = i/(n+1)
+        pts.append((mid_sh[0]+t*(mid_hip[0]-mid_sh[0]),
+                     mid_sh[1]+t*(mid_hip[1]-mid_sh[1])))
+    pts.append(mid_hip)
+    return pts
 
 
-def find_waist_points(image_bgr, y_top, y_bottom,
-                       person_mask=None,
-                       top_margin_frac=WAIST_TOP_MARGIN_FRAC,
-                       bottom_margin_frac=WAIST_BOTTOM_MARGIN_FRAC,
-                       bg_dist_threshold=WAIST_BG_DIST_THRESHOLD,
-                       min_valid_rows=WAIST_MIN_VALID_ROWS,
-                       min_width_frac=0.10,
-                       bridge_gap_frac=0.015):
-    """หาตำแหน่งจุด 'เอว' ซ้าย/ขวา จากรูปทรงลำตัว (silhouette) แทนที่จะพึ่งจุดสะโพก
-    เหมาะกับภาพที่ถูก crop สูงกว่าสะโพก เพราะเอวมักยังติดอยู่ในเฟรม
-    ใช้ person_mask ที่คำนวณไว้แล้วครั้งเดียว (จาก get_person_mask) ถ้ามีให้ แทนที่จะ
-    ประมาณพื้นหลังซ้ำเองต่อแถว คืนค่า (left_pt, right_pt) หรือ None ถ้าหาไม่ได้ชัดพอ"""
-    h, w, _ = image_bgr.shape
-    y_top = max(0, min(int(y_top), h - 1))
-    y_bottom = max(0, min(int(y_bottom), h - 1))
-    if y_bottom <= y_top:
-        return None
-
-    span = y_bottom - y_top
-    y_start = y_top + int(span * top_margin_frac)
-    y_end   = y_bottom - int(span * bottom_margin_frac)
-    if y_end <= y_start:
-        return None
-
-    if person_mask is None or person_mask.ndim != 2 or person_mask.shape != (h, w):
-        person_mask = np.ones((h, w), dtype=bool)
-
-    bridge_gap = max(4, int(w * bridge_gap_frac))
-    min_width  = w * min_width_frac
-    left_xs, right_xs = {}, {}
-
-    for y in range(y_start, y_end):
-        fg = person_mask[y]
-
-        runs = _merge_close_runs(fg, bridge_gap)
-        if not runs:
-            continue
-        best = max(runs, key=lambda r: r[1] - r[0])  # ช่วงลำตัว = ช่วงที่กว้างสุดหลังเชื่อมรอยเงา
-        if (best[1] - best[0]) < min_width:
-            continue  # แถวนี้หาลำตัวไม่เจอชัดพอ ข้ามไป
-
-        left_xs[y]  = best[0]
-        right_xs[y] = best[1]
-
-    if len(left_xs) < min_valid_rows or len(right_xs) < min_valid_rows:
-        return None
-
-    # จุดเอวฝั่งซ้าย = แถวที่ขอบซ้ายเว้าเข้ามาทางขวาสุด (x มากสุด)
-    left_waist_y  = max(left_xs, key=lambda y: left_xs[y])
-    # จุดเอวฝั่งขวา = แถวที่ขอบขวาเว้าเข้ามาทางซ้ายสุด (x น้อยสุด)
-    right_waist_y = min(right_xs, key=lambda y: right_xs[y])
-
-    # เช็คความสมเหตุสมผล: เอวจริงของคนสองข้างควรอยู่ระดับใกล้เคียงกัน ถ้าต่างกันเยอะเกินไป
-    # (เช่น คนรูปร่างไม่มีเอวคอดชัด ทำให้จุด 'เว้าที่สุด' หลุดไปเจอสิ่งรบกวนแทน) ถือว่าไม่น่าเชื่อถือ
-    height_diff_ratio = abs(left_waist_y - right_waist_y) / span
-    if height_diff_ratio > WAIST_MAX_HEIGHT_DIFF_RATIO:
-        return None
-
-    left_pt  = (float(left_xs[left_waist_y]),   float(left_waist_y))
-    right_pt = (float(right_xs[right_waist_y]), float(right_waist_y))
-    return left_pt, right_pt
-
-
-def draw_dashed_line(img, y, x_left, x_right, color=(200, 200, 200), thickness=1):
-    for x in range(x_left, x_right, 20):
-        cv2.line(img, (x, y), (min(x + 10, x_right), y), color, thickness)
-
-
-def draw_zone_label(img, label, y_mid, color_bg, x_start):
-    cv2.rectangle(img, (x_start, y_mid - 14), (x_start + 130, y_mid + 14), color_bg, -1)
-    cv2.rectangle(img, (x_start, y_mid - 14), (x_start + 130, y_mid + 14), (255, 255, 255), 1)
-    cv2.putText(img, label, (x_start + 5, y_mid + 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
-
-
-def estimate_neck_point(nose, left_ear, right_ear, mid_shoulder_x, mid_shoulder_y, w, h):
-    """ประมาณตำแหน่ง 'โคนคอ / โหนกกระดูกคอ (C7 vertebra prominens)'
-    จากแนวหู (ประมาณแนวศีรษะ) ไล่ลงมาหาแนวไหล่ ~28% ของระยะห่าง
-    ซึ่งใกล้เคียงตำแหน่งโหนกที่นูนที่สุดของกระดูกสันหลังส่วนคอ"""
-    mid_ear_x = (left_ear.x + right_ear.x) / 2 * w
-    mid_ear_y = (left_ear.y + right_ear.y) / 2 * h
-    t = 0.28
-    neck_x = mid_shoulder_x + t * (mid_ear_x - mid_shoulder_x)
-    neck_y = mid_shoulder_y + t * (mid_ear_y - mid_shoulder_y)
-    return neck_x, neck_y
-
-
-def build_spine_chain(neck_pt, mid_shoulder, mid_hip, n_intermediate=3):
-    """สร้างจุดข้อต่อไล่ตามแนวกระดูกสันหลัง: คอ -> ไหล่ -> (ทรวงอก/เอวโดยประมาณ) -> สะโพก
-    จุดตรงกลางไล่เรียงเป็นสัดส่วนระหว่างไหล่กับสะโพก แทนระดับกระดูกสันหลังช่วงอก/เอวโดยประมาณ"""
-    points = [neck_pt, mid_shoulder]
-    for i in range(1, n_intermediate + 1):
-        t = i / (n_intermediate + 1)
-        x = mid_shoulder[0] + t * (mid_hip[0] - mid_shoulder[0])
-        y = mid_shoulder[1] + t * (mid_hip[1] - mid_shoulder[1])
-        points.append((x, y))
-    points.append(mid_hip)
-    return points
-
-
-def draw_spine_chain(img, points, dev_low_ratio=0.02, dev_high_ratio=0.05):
-    """วาดกระดูกสันหลังเป็นเส้นตรงต่อกันทีละข้อ (polyline) พร้อมจุดข้อต่อ
-    แทนที่จะเป็นเส้นโค้งเบซิเยร์เรียบ ๆ เพื่อให้เห็นตำแหน่งแต่ละระดับชัดเจน
-    สีของจุดข้อต่อบ่งบอกระดับการเบี่ยงเบนจากแนวดิ่งอ้างอิง (คอ-สะโพก) ของข้อนั้น ๆ"""
-    ref_top = points[0]
-    ref_bottom = points[-1]
-    ref_dx = ref_bottom[0] - ref_top[0]
-    ref_dy = ref_bottom[1] - ref_top[1]
+def draw_spine_chain(img, pts, dev_lo=0.02, dev_hi=0.05):
+    ref_dx = pts[-1][0]-pts[0][0]
+    ref_dy = pts[-1][1]-pts[0][1]
     ref_len = math.hypot(ref_dx, ref_dy) or 1.0
 
-    # เส้นอ้างอิงแนวดิ่ง (plumb line) แบบเส้นประ เพื่อเทียบความเอียง
-    p_top = (int(ref_top[0]), int(ref_top[1]))
-    p_bottom = (int(ref_bottom[0]), int(ref_bottom[1]))
+    # เส้นประแนวอ้างอิง
     n_dash = 24
     for i in range(n_dash):
-        if i % 2 == 0:
-            continue
-        t0, t1 = i / n_dash, (i + 1) / n_dash
-        x0 = int(ref_top[0] + t0 * ref_dx); y0 = int(ref_top[1] + t0 * ref_dy)
-        x1 = int(ref_top[0] + t1 * ref_dx); y1 = int(ref_top[1] + t1 * ref_dy)
-        cv2.line(img, (x0, y0), (x1, y1), (180, 180, 180), 1, cv2.LINE_AA)
+        if i % 2 == 0: continue
+        t0, t1 = i/n_dash, (i+1)/n_dash
+        cv2.line(img,
+                 (int(pts[0][0]+t0*ref_dx), int(pts[0][1]+t0*ref_dy)),
+                 (int(pts[0][0]+t1*ref_dx), int(pts[0][1]+t1*ref_dy)),
+                 (180,180,180), 1, cv2.LINE_AA)
 
-    # เส้นกระดูกสันหลัง: ต่อจุดข้อต่อด้วยเส้นตรงทีละช่วง (ไม่ใช่เส้นโค้งเรียบ)
-    for i in range(len(points) - 1):
-        p1 = (int(points[i][0]), int(points[i][1]))
-        p2 = (int(points[i + 1][0]), int(points[i + 1][1]))
-        cv2.line(img, p1, p2, (0, 255, 255), 3, cv2.LINE_AA)
+    for i in range(len(pts)-1):
+        cv2.line(img,
+                 (int(pts[i][0]), int(pts[i][1])),
+                 (int(pts[i+1][0]), int(pts[i+1][1])),
+                 (0,255,255), 3, cv2.LINE_AA)
 
-    max_dev_px = 0.0
-    max_dev_dir = "-"
-    joint_devs = []
-    for pt in points:
-        px, py = pt
-        vx, vy = px - ref_top[0], py - ref_top[1]
-        proj = (vx * ref_dx + vy * ref_dy) / (ref_len ** 2)
-        proj = min(max(proj, 0.0), 1.0)
-        line_x = ref_top[0] + proj * ref_dx
-        line_y = ref_top[1] + proj * ref_dy
-        dev_px = px - line_x  # ค่าบวก = เบี่ยงขวา, ค่าลบ = เบี่ยงซ้าย (เทียบผู้ถูกถ่ายภาพ)
-        dev_ratio = abs(dev_px) / ref_len
-        joint_devs.append(dev_px)
+    max_dev_px, max_dev_dir, devs = 0.0, "-", []
+    for pt in pts:
+        vx, vy = pt[0]-pts[0][0], pt[1]-pts[0][1]
+        proj = min(max((vx*ref_dx+vy*ref_dy)/ref_len**2, 0), 1)
+        lx = pts[0][0]+proj*ref_dx; ly = pts[0][1]+proj*ref_dy
+        dev = pt[0]-lx
+        devs.append(dev)
+        dr = abs(dev)/ref_len
+        c = (0,200,0) if dr<dev_lo else (0,165,255) if dr<dev_hi else (0,0,255)
+        cv2.circle(img, (int(pt[0]), int(pt[1])), 7, c, -1)
+        cv2.circle(img, (int(pt[0]), int(pt[1])), 7, (255,255,255), 1, cv2.LINE_AA)
+        if abs(dev) > abs(max_dev_px):
+            max_dev_px = dev
+            max_dev_dir = "ขวา" if dev>0 else "ซ้าย" if dev<0 else "-"
 
-        if abs(dev_px) > abs(max_dev_px):
-            max_dev_px = dev_px
-            max_dev_dir = "ขวา" if dev_px > 0 else "ซ้าย" if dev_px < 0 else "-"
-
-        if dev_ratio < dev_low_ratio:
-            color = (0, 200, 0)
-        elif dev_ratio < dev_high_ratio:
-            color = (0, 165, 255)
-        else:
-            color = (0, 0, 255)
-
-        cv2.circle(img, (int(px), int(py)), 7, color, -1)
-        cv2.circle(img, (int(px), int(py)), 7, (255, 255, 255), 1, cv2.LINE_AA)
-
-    max_dev_ratio = abs(max_dev_px) / ref_len
-    return {
-        "max_dev_px": max_dev_px,
-        "max_dev_ratio": max_dev_ratio,
-        "max_dev_dir": max_dev_dir,
-        "joint_devs": joint_devs,
-        "ref_len": ref_len,
-    }
+    return {"max_dev_ratio": abs(max_dev_px)/ref_len,
+            "max_dev_dir": max_dev_dir,
+            "joint_devs": devs}
 
 
-def find_scapula_peaks(image_bgr, annotated, y_top, y_bottom, x_center, w,
-                        person_mask=None, edge_margin_frac=0.12, min_significance=1.5):
-    """หาจุดที่สะบักนูนที่สุดของแต่ละฝั่ง 'แยกกันอิสระ' โดยลบแนวโน้มการไล่แสง
-    (ผิวหลังสว่างไล่ระดับจากไหล่ลงเอวตามธรรมชาติ) ด้วยวิธี linear detrend
-    (fit เส้นตรงเข้ากับสัญญาณความสว่างแล้วลบออก) ซึ่งไม่มีปัญหา edge bias
-    แบบ moving-average ที่เคยลองมาก่อน แล้วตัดขอบบน-ล่างออกจากการค้นหาจุดพีค
-    (กันจุดหลอกที่ขอบ) เหลือแต่ส่วนที่ 'นูนกว่าแนวโน้มรอบข้าง' จริงๆ
+def find_scapula_landmark_based(image_bgr, left_shoulder, right_shoulder, w, h):
+    """วิเคราะห์สะบักโดยใช้ตำแหน่ง landmark ไหล่เป็น reference
+    — แบ่งโซนซ้าย/ขวาด้วย x กึ่งกลางไหล่จริง ไม่พึ่ง mask"""
+    sx_l = int(left_shoulder.x * w)
+    sx_r = int(right_shoulder.x * w)
+    sy   = int((left_shoulder.y + right_shoulder.y)/2 * h)
+    cx   = (sx_l + sx_r) // 2
 
-    ใช้ person_mask (จาก get_person_mask) เพื่อเฉลี่ยความสว่างเฉพาะพิกเซลที่เป็น
-    'คน' ต่อแถวเท่านั้น กันพื้นหลังที่หลุดเข้ามาในกรอบ (เช่น ใกล้รักแร้/ขอบแขน)
-    ปนเข้าไปในค่าความสว่างจนสัญญาณเพี้ยน
-
-    ก่อนเชื่อผลจะเช็คว่าจุดพีคที่เจอ 'โดดเด่นกว่าสัญญาณรบกวนทั่วไป' มากพอไหม
-    (peak detail ต้องเกิน min_significance เท่าของค่า SD ของสัญญาณทั้งเส้น)
-    ถ้าไม่ถึง แปลว่าไม่มีตุ่มนูนที่มองเห็นได้จริง (เช่น คนที่มีไขมันใต้ผิวหนังมาก
-    ไม่มีสะบักให้เห็นเป็นเงา) จะคืนค่า detected=False แทนที่จะฟันธงผิดๆ
-
-    คืนค่า dict ของผล หรือ None ถ้าโซนเล็กเกินไป"""
-    if y_bottom <= y_top + 10 or not (0 < x_center < w):
+    # โซนสะบัก: ใต้ไหล่ 10%-55% ของความสูงภาพ
+    h_img = image_bgr.shape[0]
+    y_top    = sy + int(0.05 * h_img)
+    y_bottom = sy + int(0.35 * h_img)
+    y_top    = max(0, min(y_top, h_img-1))
+    y_bottom = max(0, min(y_bottom, h_img-1))
+    if y_bottom - y_top < 20:
         return None
+
     region = image_bgr[y_top:y_bottom, :, :]
-    h_r, w_r, _ = region.shape
-    if h_r < 20 or w_r < 10:
-        return None
-    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    cx = min(x_center, w_r - 1)
+    gray   = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    h_r, w_r = gray.shape
+    cx_r = min(cx, w_r-1)
 
-    if person_mask is None or person_mask.ndim != 2 or person_mask.shape != image_bgr.shape[:2]:
-        mask_region = np.ones((h_r, w_r), dtype=bool)
+    def detrended_peak(col_data):
+        n = len(col_data)
+        if n < 6: return 0, 0.0, 0.0
+        x = np.arange(n, dtype=np.float32)
+        coeffs = np.polyfit(x, col_data, 1)
+        detail = col_data - np.polyval(coeffs, x)
+        margin = max(1, n//8)
+        seg = detail[margin:n-margin]
+        if len(seg) == 0: return 0, 0.0, 0.0
+        peak_idx = int(np.argmax(seg)) + margin
+        sig = float(detail[peak_idx]) / (float(np.std(detail)) or 1e-6)
+        return peak_idx, float(col_data[peak_idx]), sig
+
+    left_profile  = gray[:, :cx_r].mean(axis=1)
+    right_profile = gray[:, cx_r:].mean(axis=1)
+
+    l_row, l_val, l_sig = detrended_peak(left_profile)
+    r_row, r_val, r_sig = detrended_peak(right_profile)
+
+    min_sig = 1.2
+    if l_sig < min_sig and r_sig < min_sig:
+        return None
+
+    diff  = abs(l_val - r_val)
+    side  = "Left" if l_val > r_val else "Right"
+    h_diff = abs(l_row - r_row) / max(h_r, 1)
+    h_side = "Left" if l_row < r_row else "Right" if r_row < l_row else "-"
+
+    return {"detected": True, "prominence_diff": diff, "prominent_side": side,
+            "height_diff_ratio": h_diff, "higher_side": h_side,
+            "left_pt": (cx_r//2, y_top+l_row),
+            "right_pt": (cx_r + (w_r-cx_r)//2, y_top+r_row)}
+
+
+def find_waist_landmark_based(image_bgr, left_shoulder, right_shoulder,
+                               left_hip, right_hip, hips_visible, w, h):
+    """หาเอวจากขอบลำตัวในโซนระหว่างไหล่-สะโพก (ใช้ landmark เป็น reference)
+    — ไม่ต้องใช้ mask เลย แค่สแกนแถวหา x ที่ pixel สว่างกว่า threshold"""
+    sx_l = int(left_shoulder.x * w)
+    sx_r = int(right_shoulder.x * w)
+    sy   = int((left_shoulder.y + right_shoulder.y)/2 * h)
+    cx   = (sx_l + sx_r) // 2
+    sh_w = abs(sx_r - sx_l)
+
+    if hips_visible:
+        hy = int((left_hip.y + right_hip.y)/2 * h)
     else:
-        mask_region = person_mask[y_top:y_bottom, :]
+        hy = min(sy + int(0.5 * h), h - 10)
 
-    left_gray,  right_gray  = gray[:, :cx],        gray[:, cx:]
-    left_mask,  right_mask  = mask_region[:, :cx], mask_region[:, cx:]
-    if left_gray.shape[1] < 5 or right_gray.shape[1] < 5:
+    span = hy - sy
+    if span < 20:
         return None
 
-    def detrended_peak(profile_2d, mask_2d):
-        # เฉลี่ยความสว่างเฉพาะพิกเซล 'คน' ต่อแถว (กันพื้นหลังปนเข้ามา)
-        counts = mask_2d.sum(axis=1)
-        sums = np.where(mask_2d, profile_2d, 0.0).sum(axis=1)
-        counts_safe = np.where(counts > 0, counts, 1)
-        profile = sums / counts_safe
-        fallback = profile_2d.mean(axis=1)  # แถวที่ไม่มีพิกเซล 'คน' เลย ใช้ค่าเฉลี่ยทั้งแถวกัน error
-        profile = np.where(counts > 0, profile, fallback)
+    y_start = sy + int(0.15 * span)
+    y_end   = hy - int(0.12 * span)
+    if y_end - y_start < 15:
+        return None
 
-        n = len(profile)
-        x = np.arange(n)
-        coeffs = np.polyfit(x, profile, deg=1)  # fit เส้นตรง = แนวโน้มการไล่แสงรวม
-        trend = np.polyval(coeffs, x)
-        detail = profile - trend  # ส่วนที่ 'นูนกว่าแนวโน้มรอบข้าง' หลังหักการไล่แสงออก
-        margin = max(1, int(n * edge_margin_frac))
-        if n - 2 * margin < 3:
-            margin = 0
-        search = detail[margin:n - margin] if margin > 0 else detail
-        peak_row = int(np.argmax(search)) + margin
-        noise_sd = float(np.std(detail)) or 1e-6
-        significance = float(detail[peak_row]) / noise_sd
-        return peak_row, float(profile[peak_row]), significance
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-    left_peak_row,  left_peak_val,  left_sig  = detrended_peak(left_gray, left_mask)
-    right_peak_row, right_peak_val, right_sig = detrended_peak(right_gray, right_mask)
+    left_xs, right_xs = {}, {}
+    for y in range(y_start, y_end):
+        row = gray[y, :].astype(np.float32)
+        # threshold แบบ adaptive: ใช้ค่าเฉลี่ยของ 2 มุม * 0.85
+        bg_l = float(row[:max(1, sx_l-sh_w//3)].mean()) if sx_l > sh_w//3 else 30.0
+        bg_r = float(row[min(w-1, sx_r+sh_w//3):].mean()) if sx_r+sh_w//3 < w else 30.0
+        th = (bg_l + bg_r) / 2 * 0.85 + 10
 
-    zone_h = y_bottom - y_top
-    height_diff_ratio = abs(left_peak_row - right_peak_row) / zone_h
-    higher_side  = "Left" if left_peak_row < right_peak_row else "Right" if right_peak_row < left_peak_row else "-"
-    prominence_diff = abs(left_peak_val - right_peak_val)
-    prominent_side  = "Left" if left_peak_val > right_peak_val else "Right"
+        # หาขอบซ้าย (จาก cx ออกไปซ้ายจนเจอ background)
+        for x in range(cx, max(0, cx - sh_w), -1):
+            if row[x] < th:
+                left_xs[y] = x
+                break
 
-    left_pt  = (x_center - cx // 2,               y_top + left_peak_row)
-    right_pt = (x_center + (w_r - cx) // 2,        y_top + right_peak_row)
+        # หาขอบขวา
+        for x in range(cx, min(w, cx + sh_w)):
+            if row[x] < th:
+                right_xs[y] = x
+                break
 
-    cv2.circle(annotated, left_pt,  6, (0, 255, 120), -1)
-    cv2.circle(annotated, right_pt, 6, (0, 255, 120), -1)
-    cv2.line(annotated, left_pt, right_pt, (0, 255, 120), 2, cv2.LINE_AA)
-    cv2.putText(annotated, f"Scapula: {prominent_side} ({prominence_diff:.1f})",
-                (10, min(y_bottom + 16, image_bgr.shape[0] - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 120), 1, cv2.LINE_AA)
+    if len(left_xs) < 10 or len(right_xs) < 10:
+        return None
 
-    return {
-        "detected": True,
-        "height_diff_ratio": height_diff_ratio,
-        "higher_side": higher_side,
-        "prominence_diff": prominence_diff,
-        "prominent_side": prominent_side,
-    }
+    # เอวซ้าย = จุดที่ขอบซ้ายเว้าเข้ามาขวาสุด (x มากสุด)
+    ly = max(left_xs, key=lambda y: left_xs[y])
+    # เอวขวา = จุดที่ขอบขวาเว้าเข้ามาซ้ายสุด (x น้อยสุด)
+    ry = min(right_xs, key=lambda y: right_xs[y])
 
+    if abs(ly - ry) / span > 0.2:
+        return None  # จุดเอวสองข้างอยู่คนละระดับเกินไป
+
+    return (float(left_xs[ly]), float(ly)), (float(right_xs[ry]), float(ry))
+
+
+# ─── วิเคราะห์หลัก ────────────────────────────────────────────────────────────
 
 def analyze_standing(image_bgr):
     h, w, _ = image_bgr.shape
-
-    rgb_image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
-    result    = detector.detect(mp_image)
+    rgb     = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    mp_img  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result  = detector.detect(mp_img)
 
     if not result.pose_landmarks:
         return None, None
 
-    # ขั้นตอนก่อนวิเคราะห์: แยกคนออกจากพื้นหลังด้วย segmentation mask ของ MediaPipe เอง
-    # (โมเดล AI ที่เทรนมาแยกคน ไม่ใช่การเดาสีพื้นหลังแบบ heuristic) รองรับพื้นหลังซับซ้อน
-    # (เช่น มีเฟอร์นิเจอร์/ลวดลาย) ได้ดีกว่ามาก ใช้ร่วมกันทั้ง Waist และ Scapula detection
-    person_mask = None
-    if result.segmentation_masks:
-        try:
-            seg = np.asarray(result.segmentation_masks[0].numpy_view())  # ค่า 0-1 = ความมั่นใจว่าเป็นคน
-            if seg.ndim == 3:
-                seg = seg[:, :, 0]  # numpy_view() บางเวอร์ชันคืนมาเป็น (h,w,1) ต้องบีบให้เหลือ 2 มิติ
-            if seg.shape != (h, w):
-                seg = cv2.resize(seg, (w, h), interpolation=cv2.INTER_LINEAR)  # กันขนาดไม่ตรงกับภาพต้นฉบับ
-            person_mask = seg > 0.5
-            if person_mask.shape != (h, w):  # เช็คซ้ำอีกชั้น กันทุกกรณีที่หลุดรอด
-                person_mask = None
-        except Exception:
-            person_mask = None
-    if person_mask is None:
-        # ถ้าไม่มี segmentation mask จาก MediaPipe ให้ถือว่าทุกพิกเซลเป็นคนไปก่อน
-        # (ไม่ใช้ heuristic เดาสีพื้นหลัง เพราะเดาผิดทำให้ฝั่งใดฝั่งหนึ่งกลายเป็นสีดำ)
-        person_mask = np.ones((h, w), dtype=bool)
-
-    # ขยาย mask และเติมรูโหว่ให้ครอบคลุมร่างกายสมบูรณ์ขึ้น
-    person_mask_u8 = person_mask.astype(np.uint8) * 255
-    kernel_dilate = np.ones((25, 25), np.uint8)
-    person_mask_u8 = cv2.dilate(person_mask_u8, kernel_dilate, iterations=3)
-    # Flood fill เติมรูโหว่ภายใน: flood จากมุม (0,0) ด้วยสี 128
-    # พื้นที่ที่ flood ไปถึง = พื้นหลังแน่นอน, ไปไม่ถึง = รูโหว่ภายในคน
-    ff = person_mask_u8.copy()
-    ff_flood = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(ff, ff_flood, (0, 0), 128)
-    interior_holes = (ff == 0)  # พื้นที่ที่ flood ไม่ถึงและไม่ใช่ mask เดิม = รูโหว่
-    person_mask_u8[interior_holes] = 255
-    person_mask = person_mask_u8 > 0
-
-    # ลบส่วนที่ mask อาจเชื่อมติดกันผิดพลาด (เช่น ช่องว่างใต้รักแร้ระหว่างแขน-ลำตัว)
-    # ด้วย erosion เบาๆ ก่อนนำไปใช้งานต่อ
-    person_mask = refine_person_mask(person_mask)
-
-    # ตัดพื้นหลังออกจริง: ทาสีส่วนที่ไม่ใช่คนให้เป็นดำล้วน โดยไม่เปลี่ยนขนาด/กรอบภาพ
-    bg_removed = image_bgr.copy()
+    # ── Step A: สร้าง mask สำหรับแสดงผลเท่านั้น ──────────────────────────────
+    person_mask = get_clean_mask(result, h, w)
+    bg_removed  = image_bgr.copy()
     bg_removed[~person_mask] = 0
-
-    # แปลงเป็นขาวดำ contrast สูงสุด ต่อจากขั้นตัดพื้นหลังทันที (ก่อนใช้เป็นภาพหลักในการวิเคราะห์)
-    # เพื่อคัดแยกสีอื่นออก เหลือแต่รายละเอียดผิว/เงาที่เด่นชัดขึ้น แล้วใช้ภาพนี้วิเคราะห์ Waist/Scapula ต่อ
     contrast_img = apply_high_contrast(bg_removed, person_mask)
+    mask_vis     = np.zeros((h, w), dtype=np.uint8)
+    mask_vis[person_mask] = 255
 
-    landmarks      = result.pose_landmarks[0]
-    nose           = landmarks[0]
-    left_ear       = landmarks[7]
-    right_ear      = landmarks[8]
-    left_shoulder  = landmarks[11]
-    right_shoulder = landmarks[12]
-    left_elbow     = landmarks[13]
-    right_elbow    = landmarks[14]
-    left_hip       = landmarks[23]
-    right_hip      = landmarks[24]
-    left_knee      = landmarks[25]
-    right_knee     = landmarks[26]
+    # ── Step B: ดึง landmark ──────────────────────────────────────────────────
+    lm          = result.pose_landmarks[0]
+    nose        = lm[0]
+    left_ear    = lm[7];   right_ear    = lm[8]
+    left_sh     = lm[11];  right_sh     = lm[12]
+    left_el     = lm[13];  right_el     = lm[14]
+    left_hip    = lm[23];  right_hip    = lm[24]
+    left_knee   = lm[25];  right_knee   = lm[26]
 
-    # เช็คว่าแขนห้อยข้างลำตัวตามธรรมชาติไหม (ใช้จุดศอกจาก MediaPipe) เพื่อความแม่นยำของ
-    # Waist/Scapula ที่วัดจากรูปทรงลำตัว ถ้าแขนอยู่ในท่าผิดปกติ ผลอาจคลาดเคลื่อนได้
-    arms_natural, arm_warn_sides = check_arms_natural(
-        left_shoulder, left_elbow, right_shoulder, right_elbow, w, h)
+    # ── Step C: Shoulder slope ────────────────────────────────────────────────
+    dx_s = (right_sh.x - left_sh.x) * w
+    dy_s = (right_sh.y - left_sh.y) * h
+    shoulder_slope  = abs(dy_s/dx_s) if dx_s != 0 else 0
+    shoulder_dir    = "right_up" if dy_s<0 else "left_up" if dy_s>0 else "level"
 
-    dx_s = (right_shoulder.x - left_shoulder.x) * w
-    dy_s = (right_shoulder.y - left_shoulder.y) * h
-    shoulder_slope = abs(dy_s / dx_s) if dx_s != 0 else 0
+    mid_sx = int((left_sh.x+right_sh.x)/2*w)
+    mid_sy = int((left_sh.y+right_sh.y)/2*h)
+    sh_w   = abs(int(right_sh.x*w) - int(left_sh.x*w))
 
-    # เช็คว่าสะโพกอยู่ในเฟรมจริงหรือไม่ (ถ้า visibility ต่ำ = โมเดลกำลังเดา ไม่ใช่จุดจริง)
-    hip_visibility = min(
-        getattr(left_hip, "visibility", 1.0),
-        getattr(right_hip, "visibility", 1.0),
-    )
-    hips_visible = hip_visibility >= HIP_VISIBILITY_THRESHOLD
+    # ── Step D: Hip slope ─────────────────────────────────────────────────────
+    hip_vis_score = min(getattr(left_hip,"visibility",1.0), getattr(right_hip,"visibility",1.0))
+    hips_visible  = hip_vis_score >= HIP_VISIBILITY_THRESHOLD
 
     if hips_visible:
-        dx_h = (right_hip.x - left_hip.x) * w
-        dy_h = (right_hip.y - left_hip.y) * h
-        hip_slope = abs(dy_h / dx_h) if dx_h != 0 else 0
-
-        # เช็คความสมเหตุสมผลเพิ่มเติม: บาง case MediaPipe มั่นใจสูงแต่จุดหลุดจริง
-        # (เช่น โดนขอบกางเกง/เงาบัง) ทำให้ hip_slope พุ่งเกินจริงทางกายวิภาค
-        # หรือเส้นสะโพกแคบผิดปกติเมื่อเทียบไหล่ -> ถือว่าจุดไม่น่าเชื่อถือ ตัดกลับไปใช้ Waist แทน
-        shoulder_width_px = abs(dx_s)
-        hip_width_px = abs(dx_h)
-        implausible_slope = hip_slope > HIP_SLOPE_MAX_PLAUSIBLE
-        implausible_width = (
-            shoulder_width_px > 0 and
-            hip_width_px < HIP_WIDTH_MIN_RATIO * shoulder_width_px
-        )
-        if implausible_slope or implausible_width:
+        dx_h = (right_hip.x-left_hip.x)*w
+        dy_h = (right_hip.y-left_hip.y)*h
+        hip_slope  = abs(dy_h/dx_h) if dx_h!=0 else 0
+        hip_dir    = "right_up" if dy_h<0 else "left_up" if dy_h>0 else "level"
+        if hip_slope > HIP_SLOPE_MAX_PLAUSIBLE or abs(dx_h) < HIP_WIDTH_MIN_RATIO*abs(dx_s):
             hips_visible = False
-            dy_h = None
-            hip_slope = None
+            hip_slope = hip_dir = None
+        else:
+            mid_hx = int((left_hip.x+right_hip.x)/2*w)
+            mid_hy = int((left_hip.y+right_hip.y)/2*h)
     else:
-        dy_h = None
-        hip_slope = None
+        hip_slope = hip_dir = None
 
-    mid_shoulder_x = int((left_shoulder.x + right_shoulder.x) / 2 * w)
-    mid_shoulder_y = int((left_shoulder.y + right_shoulder.y) / 2 * h)
-    y_knee         = int((left_knee.y + right_knee.y) / 2 * h)
+    if not hips_visible:
+        mid_hx, mid_hy = mid_sx, h-10
+
+    # Trunk tilt
+    if hips_visible:
+        dx_t = mid_sx - mid_hx; dy_t = mid_sy - mid_hy
+        trunk_tilt = math.degrees(math.atan2(abs(dx_t),abs(dy_t))) if dy_t!=0 else 90.0
+        same_dir   = shoulder_dir == hip_dir and shoulder_dir != "level"
+    else:
+        trunk_tilt = None
+        same_dir   = False
+
+    # ── Step E: Spine chain ───────────────────────────────────────────────────
+    neck_pt    = estimate_neck(nose, left_ear, right_ear, mid_sx, mid_sy, w, h)
+    spine_pts  = build_spine_chain(neck_pt, (mid_sx,mid_sy), (mid_hx,mid_hy), n=3)
+
+    # ── Step F: Waist (landmark-based, no mask) ───────────────────────────────
+    waist_res = find_waist_landmark_based(image_bgr, left_sh, right_sh,
+                                           left_hip, right_hip, hips_visible, w, h)
+
+    if waist_res:
+        lw, rw      = waist_res
+        dx_w        = rw[0]-lw[0]; dy_w = rw[1]-lw[1]
+        waist_slope = abs(dy_w/dx_w) if dx_w!=0 else 0
+        waist_dir   = "right_up" if dy_w<0 else "left_up" if dy_w>0 else "level"
+        waist_ok    = True
+    else:
+        waist_slope = waist_dir = None
+        waist_ok    = False
+
+    # ── Step G: Scapula (landmark-based, no mask) ─────────────────────────────
+    scap_res = find_scapula_landmark_based(image_bgr, left_sh, right_sh, w, h)
+
+    # ── Step H: วาดภาพผลลัพธ์ ─────────────────────────────────────────────────
+    annotated = image_bgr.copy()
+    y_knee    = int((left_knee.y+right_knee.y)/2*h)
+    xlbl      = w - 140
+
+    draw_dashed_line(annotated, mid_sy, 10, w-10)
+    if hips_visible:
+        draw_dashed_line(annotated, mid_hy, 10, w-10)
 
     if hips_visible:
-        mid_hip_x = int((left_hip.x + right_hip.x) / 2 * w)
-        mid_hip_y = int((left_hip.y + right_hip.y) / 2 * h)
+        draw_zone_label(annotated,"Zone1: Shoulder",(mid_sy+mid_hy)//2,(200,100,30),xlbl)
+        draw_zone_label(annotated,"Zone2: Hip",     (mid_hy+y_knee)//2,(30,80,200), xlbl)
     else:
-        # สะโพกไม่อยู่ในเฟรม -> ใช้ขอบล่างสุดของภาพที่มองเห็นจริงแทน (ตรงลงมาจากไหล่)
-        mid_hip_x = mid_shoulder_x
-        mid_hip_y = h - 10
+        draw_zone_label(annotated,"Zone1: Shoulder",(mid_sy+h)//2,     (200,100,30),xlbl)
 
-    if hips_visible:
-        dx_trunk = mid_shoulder_x - mid_hip_x
-        dy_trunk = mid_shoulder_y - mid_hip_y
-        trunk_tilt_angle = math.degrees(math.atan2(abs(dx_trunk), abs(dy_trunk))) if dy_trunk != 0 else 90.0
-    else:
-        trunk_tilt_angle = None
-
-    shoulder_tilt_dir = "right_up" if dy_s < 0 else "left_up" if dy_s > 0 else "level"
-    if hips_visible:
-        hip_tilt_dir   = "right_up" if dy_h < 0 else "left_up" if dy_h > 0 else "level"
-        same_direction = (shoulder_tilt_dir == hip_tilt_dir) and shoulder_tilt_dir != "level"
-    else:
-        hip_tilt_dir   = "unknown"
-        same_direction = False
-
-    annotated    = image_bgr.copy()
-    x_left_edge  = 10
-    x_right_edge = w - 10
-
-    # เส้นประแบ่งโซน
-    draw_dashed_line(annotated, mid_shoulder_y, x_left_edge, x_right_edge)
-    if hips_visible:
-        draw_dashed_line(annotated, mid_hip_y, x_left_edge, x_right_edge)
-
-    # ป้ายโซน
-    x_label = w - 140
-    if hips_visible:
-        draw_zone_label(annotated, 'Zone1: Shoulder', (mid_shoulder_y + mid_hip_y) // 2, (200, 100, 30), x_label)
-        draw_zone_label(annotated, 'Zone2: Hip',      (mid_hip_y + y_knee) // 2,         (30, 80, 200),  x_label)
-    else:
-        draw_zone_label(annotated, 'Zone1: Shoulder', (mid_shoulder_y + h) // 2, (200, 100, 30), x_label)
-        cv2.putText(annotated, "Hip: not in frame", (10, h - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-
-    # เส้นไหล่และสะโพก
+    # เส้นไหล่
     cv2.line(annotated,
-             (int(left_shoulder.x*w), int(left_shoulder.y*h)),
-             (int(right_shoulder.x*w), int(right_shoulder.y*h)),
-             (255, 200, 0), 3)
+             (int(left_sh.x*w), int(left_sh.y*h)),
+             (int(right_sh.x*w),int(right_sh.y*h)),
+             (0,200,255), 3, cv2.LINE_AA)
+
+    # เส้นสะโพก
     if hips_visible:
         cv2.line(annotated,
                  (int(left_hip.x*w), int(left_hip.y*h)),
-                 (int(right_hip.x*w), int(right_hip.y*h)),
-                 (255, 200, 0), 3)
+                 (int(right_hip.x*w),int(right_hip.y*h)),
+                 (0,200,255), 3, cv2.LINE_AA)
 
-    # จุดพิกัด
-    visible_points = [left_shoulder, right_shoulder]
-    if hips_visible:
-        visible_points += [left_hip, right_hip]
-    for lm in visible_points:
-        x, y = int(lm.x*w), int(lm.y*h)
-        cv2.circle(annotated, (x, y), 8, (0, 0, 255), -1)
+    # จุดไหล่/สะโพก
+    for lmark in ([left_sh, right_sh] + ([left_hip, right_hip] if hips_visible else [])):
+        cv2.circle(annotated,(int(lmark.x*w),int(lmark.y*h)),8,(0,0,255),-1)
 
-    # แนวกระดูกสันหลัง: เส้นตรงต่อกันทีละข้อ (polyline) ยึดจุดจาก
-    # คอ (ประมาณจากหู+ไหล่) -> ไหล่ -> ระดับอก/เอวโดยประมาณ -> สะโพก
-    neck_pt = estimate_neck_point(nose, left_ear, right_ear, mid_shoulder_x, mid_shoulder_y, w, h)
-    spine_points = build_spine_chain(
-        neck_pt,
-        (mid_shoulder_x, mid_shoulder_y),
-        (mid_hip_x, mid_hip_y),
-        n_intermediate=3,
-    )
-    spine_info = draw_spine_chain(annotated, spine_points)
+    # spine
+    spine_info = draw_spine_chain(annotated, spine_pts)
 
-    # Scapula: หาจุดนูนสุดของสะบักแต่ละฝั่งแยกกัน (ปรับตามตำแหน่งจริง ไม่ใช่กล่องนิ่ง)
-    # ข้ามช่วงคอ-บ่า (trapezius) ที่โค้งมนสว่างจ้าก่อน ไม่งั้นจะไปเจอ 'ตุ่มปลอม' ตรงนั้น
-    # แทนที่จะเป็นตัวสะบักจริงที่อยู่ต่ำลงมา แล้วขยายโซนถึง ~45% ของช่วงไหล่-เอว
-    back_span = mid_hip_y - mid_shoulder_y
-    scapula_y_top = mid_shoulder_y + int(0.15 * back_span)
-    scapula_y_bottom = mid_shoulder_y + int(SCAPULA_ZONE_FRAC * back_span)
-    scapula_result = find_scapula_peaks(
-        contrast_img, annotated, scapula_y_top, scapula_y_bottom, mid_shoulder_x, w,
-        person_mask=person_mask, edge_margin_frac=0.20)
-    if scapula_result and scapula_result.get("detected"):
-        scapula_detected      = True
-        scapula_diff          = scapula_result["prominence_diff"]
-        scapula_side          = scapula_result["prominent_side"]
-        scapula_height_ratio  = scapula_result["height_diff_ratio"]
-        scapula_higher_side   = scapula_result["higher_side"]
-    else:
-        scapula_detected = False
-        scapula_diff = 0.0
-        scapula_side = "-"
-        scapula_height_ratio = 0.0
-        scapula_higher_side = "-"
+    # waist
+    if waist_ok:
+        lw, rw = waist_res
+        cv2.circle(annotated,(int(lw[0]),int(lw[1])),6,(255,0,255),-1)
+        cv2.circle(annotated,(int(rw[0]),int(rw[1])),6,(255,0,255),-1)
+        cv2.line(annotated,(int(lw[0]),int(lw[1])),(int(rw[0]),int(rw[1])),(255,0,255),2,cv2.LINE_AA)
+        cv2.putText(annotated,"Waist",
+                    (int(lw[0])-10,int(min(lw[1],rw[1]))-12),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.45,(255,0,255),1,cv2.LINE_AA)
 
-    y_top, y_bottom = mid_shoulder_y, mid_hip_y  # ใช้ต่อสำหรับหา Waist
+    # scapula
+    if scap_res and scap_res.get("detected"):
+        lp = scap_res["left_pt"]; rp = scap_res["right_pt"]
+        cv2.circle(annotated,lp,6,(0,255,120),-1)
+        cv2.circle(annotated,rp,6,(0,255,120),-1)
+        cv2.line(annotated,lp,rp,(0,255,120),2,cv2.LINE_AA)
+        cv2.putText(annotated,
+                    f"Scapula:{scap_res['prominent_side']}({scap_res['prominence_diff']:.1f})",
+                    (10, min(lp[1]+20, h-5)),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.45,(0,255,120),1,cv2.LINE_AA)
 
-    # เอว: หาจากรูปทรงลำตัว ไม่พึ่งจุด landmark สะโพก จึงใช้ได้แม้ภาพตัดสูงกว่าสะโพก
-    waist_result = find_waist_points(contrast_img, y_top, y_bottom, person_mask=person_mask)
-    if waist_result:
-        left_waist, right_waist = waist_result
-        dx_wst = right_waist[0] - left_waist[0]
-        dy_wst = right_waist[1] - left_waist[1]
-        waist_slope    = abs(dy_wst / dx_wst) if dx_wst != 0 else 0
-        waist_tilt_dir = "right_up" if dy_wst < 0 else "left_up" if dy_wst > 0 else "level"
-        waist_detected = True
-
-        cv2.circle(annotated, (int(left_waist[0]), int(left_waist[1])), 6, (255, 0, 255), -1)
-        cv2.circle(annotated, (int(right_waist[0]), int(right_waist[1])), 6, (255, 0, 255), -1)
-        cv2.line(annotated,
-                 (int(left_waist[0]), int(left_waist[1])),
-                 (int(right_waist[0]), int(right_waist[1])),
-                 (255, 0, 255), 2, cv2.LINE_AA)
-        cv2.putText(annotated, "Waist",
-                    (int(left_waist[0]) - 10, int(min(left_waist[1], right_waist[1])) - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
-    else:
-        waist_slope    = None
-        waist_tilt_dir = "unknown"
-        waist_detected = False
+    if not hips_visible:
+        cv2.putText(annotated,"Hip: not in frame",(10,h-15),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255),1,cv2.LINE_AA)
 
     return {
         "shoulder_slope":       shoulder_slope,
+        "shoulder_tilt_dir":    shoulder_dir,
         "hip_slope":            hip_slope,
-        "trunk_tilt_angle":     trunk_tilt_angle,
-        "shoulder_tilt_dir":    shoulder_tilt_dir,
-        "hip_tilt_dir":         hip_tilt_dir,
-        "same_direction":       same_direction,
-        "scapula_detected":     scapula_detected,
-        "scapula_diff":         scapula_diff,
-        "scapula_side":         scapula_side,
-        "scapula_height_ratio": scapula_height_ratio,
-        "scapula_higher_side":  scapula_higher_side,
+        "hip_tilt_dir":         hip_dir,
+        "trunk_tilt_angle":     trunk_tilt,
+        "same_direction":       same_dir,
+        "hips_visible":         hips_visible,
+        "waist_detected":       waist_ok,
+        "waist_slope":          waist_slope,
+        "waist_tilt_dir":       waist_dir,
+        "scapula_detected":     bool(scap_res and scap_res.get("detected")),
+        "scapula_diff":         scap_res["prominence_diff"] if scap_res and scap_res.get("detected") else 0.0,
+        "scapula_side":         scap_res["prominent_side"]  if scap_res and scap_res.get("detected") else "-",
+        "scapula_height_ratio": scap_res["height_diff_ratio"] if scap_res and scap_res.get("detected") else 0.0,
+        "scapula_higher_side":  scap_res["higher_side"]      if scap_res and scap_res.get("detected") else "-",
         "spine_dev_ratio":      spine_info["max_dev_ratio"],
         "spine_dev_dir":        spine_info["max_dev_dir"],
         "spine_joint_devs":     spine_info["joint_devs"],
-        "hips_visible":         hips_visible,
-        "waist_detected":       waist_detected,
-        "waist_slope":          waist_slope,
-        "waist_tilt_dir":       waist_tilt_dir,
         "person_mask":          person_mask,
         "bg_removed":           bg_removed,
         "contrast_img":         contrast_img,
-        "arms_natural":         arms_natural,
-        "arm_warn_sides":       arm_warn_sides,
+        "mask_vis":             mask_vis,
+        "arms_natural":         True,
+        "arm_warn_sides":       [],
     }, annotated
 
 
-def get_risk_level_default(value, low_th, high_th):
-    if value < low_th:
-        return "ต่ำ (ปกติ)", "green"
-    elif value < high_th:
-        return "ปานกลาง", "orange"
-    else:
-        return "สูง", "red"
+# ─── Risk helpers ──────────────────────────────────────────────────────────────
 
+def get_risk_level_default(value, lo, hi):
+    if value is None: return "—", "gray"
+    return ("ต่ำ (ปกติ)","green") if value<lo else ("ปานกลาง","orange") if value<hi else ("สูง","red")
 
 def load_baseline():
     if os.path.exists(BASELINE_FILE):
-        with open(BASELINE_FILE, "r", encoding="utf-8") as f:
+        with open(BASELINE_FILE,"r",encoding="utf-8") as f:
             return json.load(f)
     return None
 
-
 def get_risk_level_baseline(value, mean, sd):
-    if sd == 0:
-        sd = 1e-6
-    diff = abs(value - mean)
-    if diff <= sd:
-        return "ต่ำ (ปกติ)", "green"
-    elif diff <= 2 * sd:
-        return "ปานกลาง", "orange"
-    else:
-        return "สูง", "red"
-
+    if value is None or sd==0: return "—","gray"
+    d = abs(value-mean); sd = max(sd,1e-6)
+    return ("ต่ำ (ปกติ)","green") if d<=sd else ("ปานกลาง","orange") if d<=2*sd else ("สูง","red")
 
 RECOMMENDATIONS = {
     "ต่ำ (ปกติ)": "ท่าทางของคุณอยู่ในเกณฑ์ปกติ ควรรักษาท่าทางที่ดีต่อไป และออกกำลังกายยืดเหยียดเป็นประจำ",
-    "ปานกลาง": "พบความเอียงเล็กน้อย แนะนำให้สังเกตท่าทางตนเองในชีวิตประจำวัน และฝึกบริหารกล้ามเนื้อหลังและไหล่ หากมีอาการผิดปกติควรพบแพทย์",
-    "สูง": "พบความเอียงค่อนข้างมาก แนะนำให้พบแพทย์หรือนักกายภาพบำบัดเพื่อตรวจวินิจฉัยเพิ่มเติม ระบบนี้เป็นเพียงการคัดกรองเบื้องต้น ไม่ใช่การวินิจฉัยทางการแพทย์"
+    "ปานกลาง":    "พบความเอียงเล็กน้อย แนะนำให้สังเกตท่าทางตนเองในชีวิตประจำวัน และฝึกบริหารกล้ามเนื้อหลังและไหล่ หากมีอาการผิดปกติควรพบแพทย์",
+    "สูง":         "พบความเอียงค่อนข้างมาก แนะนำให้พบแพทย์หรือนักกายภาพบำบัดเพื่อตรวจวินิจฉัยเพิ่มเติม ระบบนี้เป็นเพียงการคัดกรองเบื้องต้น ไม่ใช่การวินิจฉัยทางการแพทย์",
 }
 
-SLOPE_LOW, SLOPE_HIGH = 0.05, 0.15
-SPINE_DEV_LOW, SPINE_DEV_HIGH = 0.02, 0.05  # สัดส่วนการเบี่ยงเบนต่อความยาวลำตัว (คอ-สะโพก)
-SCAPULA_DIFF_LOW, SCAPULA_DIFF_HIGH = 6.0, 15.0  # ความนูนต่างกัน (สเกล 0-255) — ตั้งสูงขึ้นกันขึ้นปานกลาง/สูงง่ายเกินไป
-SCAPULA_HEIGHT_LOW, SCAPULA_HEIGHT_HIGH = 0.20, 0.40  # สัดส่วนตำแหน่งสูง-ต่ำต่างกัน ต่อความสูงโซนที่วัด
+SLOPE_LOW_UI, SLOPE_HIGH_UI = 0.05, 0.15
+
 baseline = load_baseline()
 
+# ─── UI ────────────────────────────────────────────────────────────────────────
+
 st.sidebar.title("เมนู")
-mode = st.sidebar.radio("เลือกโหมด", [
+mode = st.sidebar.radio("เลือกโหมด",[
     "ประเมินผล",
-    "Calibration (สร้างเกณฑ์จากกลุ่มปกติ)"
+    "Calibration (สร้างเกณฑ์จากกลุ่มปกติ)",
 ])
 
+# ── Calibration mode ────────────────────────────────────────────────────────────
 if mode == "Calibration (สร้างเกณฑ์จากกลุ่มปกติ)":
     st.title("📊 Calibration: สร้างเกณฑ์จากกลุ่มคนหลังตรง")
-    st.write("อัปโหลดภาพถ่ายด้านหลัง (ท่ายืนตรง) ของกลุ่มคนที่หลังตรง/ปกติ หลายๆ รูป")
-
-    uploaded_files = st.file_uploader(
-        "เลือกภาพถ่าย (หลายรูปได้)",
-        type=["jpg", "jpeg", "png"],
-        accept_multiple_files=True
-    )
-
-    if uploaded_files:
-        rows = []
-        hip_vals = []
-        waist_vals = []
-        scapula_vals = []
-        for f in uploaded_files:
-            file_bytes = np.asarray(bytearray(f.read()), dtype=np.uint8)
-            image_bgr  = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-            result, _  = analyze_standing(image_bgr)
-
-            if result is None:
-                st.warning(f"ไม่พบร่างกายในภาพ: {f.name}")
-                continue
-
+    files = st.file_uploader("เลือกภาพถ่าย (หลายรูปได้)",
+                              type=["jpg","jpeg","png"], accept_multiple_files=True)
+    if files:
+        rows=[]; hip_v=[]; waist_v=[]; scap_v=[]
+        for f in files:
+            fb   = np.asarray(bytearray(f.read()),dtype=np.uint8)
+            img  = cv2.imdecode(fb, cv2.IMREAD_COLOR)
+            res, _ = analyze_standing(img)
+            if res is None:
+                st.warning(f"ไม่พบร่างกายในภาพ: {f.name}"); continue
             row = {
                 "filename":        f.name,
-                "shoulder_slope":  round(result["shoulder_slope"], 4),
-                "trunk_tilt":      round(result["trunk_tilt_angle"], 2) if result["trunk_tilt_angle"] is not None else None,
-                "scapula_diff":    round(result["scapula_diff"], 2) if result["scapula_detected"] else None,
-                "spine_dev_ratio": round(result["spine_dev_ratio"], 4),
-                "hip_slope":       round(result["hip_slope"], 4) if result["hips_visible"] else None,
-                "waist_slope":     round(result["waist_slope"], 4) if result["waist_detected"] else None,
+                "shoulder_slope":  round(res["shoulder_slope"],4),
+                "spine_dev_ratio": round(res["spine_dev_ratio"],4),
+                "hip_slope":       round(res["hip_slope"],4) if res["hips_visible"] else None,
+                "waist_slope":     round(res["waist_slope"],4) if res["waist_detected"] else None,
+                "scapula_diff":    round(res["scapula_diff"],2) if res["scapula_detected"] else None,
             }
             rows.append(row)
-            if result["hips_visible"]:
-                hip_vals.append(row["hip_slope"])
-            if result["waist_detected"]:
-                waist_vals.append(row["waist_slope"])
-            if result["scapula_detected"]:
-                scapula_vals.append(row["scapula_diff"])
-            if not result["hips_visible"] and not result["waist_detected"]:
-                st.warning(f"ไม่เห็นทั้งสะโพกและเอวในภาพ (ข้ามการนับ Hip/Waist สำหรับรูปนี้): {f.name}")
+            if res["hips_visible"]: hip_v.append(res["hip_slope"])
+            if res["waist_detected"]: waist_v.append(res["waist_slope"])
+            if res["scapula_detected"]: scap_v.append(res["scapula_diff"])
 
         if rows:
-            st.subheader("ผลลัพธ์รายบุคคล")
             st.table(rows)
-
-            def _stat(vals):
-                if not vals:
-                    return None
-                return {"mean": float(np.mean(vals)), "sd": float(np.std(vals))}
-
+            def _s(v): return {"mean":float(np.mean(v)),"sd":float(np.std(v))} if v else None
             stats = {
-                "n":                len(rows),
-                "shoulder_slope":   _stat([r["shoulder_slope"] for r in rows]),
-                "trunk_tilt_angle": _stat([r["trunk_tilt"] for r in rows if r["trunk_tilt"] is not None]),
-                "scapula_diff":     _stat(scapula_vals),
-                "spine_dev_ratio":  _stat([r["spine_dev_ratio"] for r in rows]),
-                "hip_slope":        _stat(hip_vals),
-                "n_hip":            len(hip_vals),
-                "waist_slope":      _stat(waist_vals),
-                "n_waist":          len(waist_vals),
+                "n": len(rows),
+                "shoulder_slope":   _s([r["shoulder_slope"]  for r in rows]),
+                "spine_dev_ratio":  _s([r["spine_dev_ratio"] for r in rows]),
+                "hip_slope":        _s(hip_v),   "n_hip":   len(hip_v),
+                "waist_slope":      _s(waist_v), "n_waist": len(waist_v),
+                "scapula_diff":     _s(scap_v),
             }
-
             st.subheader("สถิติสรุป (Mean ± SD)")
-            st.write(f"จำนวนตัวอย่างทั้งหมด: {stats['n']} คน "
-                     f"(มีข้อมูลสะโพก {stats['n_hip']} คน, มีข้อมูลเอว {stats['n_waist']} คน)")
-            for key, label in [
-                ("shoulder_slope",   "Shoulder Slope"),
-                ("hip_slope",        "Hip Slope"),
-                ("waist_slope",      "Waist Slope"),
-                ("trunk_tilt_angle", "Trunk Tilt Angle"),
-                ("scapula_diff",     "Scapula Prominence"),
-                ("spine_dev_ratio",  "Spine Deviation Ratio"),
-            ]:
-                if stats[key] is None:
-                    st.write(f"{label}: ไม่มีข้อมูลเพียงพอ")
-                else:
-                    st.write(f"{label}: {stats[key]['mean']:.4f} ± {stats[key]['sd']:.4f}")
-
+            st.write(f"จำนวน: {stats['n']} คน (สะโพก {stats['n_hip']}, เอว {stats['n_waist']})")
+            for k,lbl in [("shoulder_slope","Shoulder Slope"),("spine_dev_ratio","Spine Deviation"),
+                          ("hip_slope","Hip Slope"),("waist_slope","Waist Slope"),("scapula_diff","Scapula Prominence")]:
+                s = stats[k]
+                st.write(f"{lbl}: {s['mean']:.4f} ± {s['sd']:.4f}" if s else f"{lbl}: ไม่มีข้อมูลเพียงพอ")
             if st.button("💾 บันทึกเป็นเกณฑ์ (baseline.json)"):
-                with open(BASELINE_FILE, "w", encoding="utf-8") as fp:
-                    json.dump(stats, fp, ensure_ascii=False, indent=2)
+                with open(BASELINE_FILE,"w",encoding="utf-8") as fp:
+                    json.dump(stats,fp,ensure_ascii=False,indent=2)
                 st.success(f"บันทึกเกณฑ์เรียบร้อย ({stats['n']} ตัวอย่าง)")
 
+# ── ประเมินผล mode ─────────────────────────────────────────────────────────────
 else:
     st.title("🦴 ระบบคัดกรองภาวะกระดูกสันหลังคดเบื้องต้น")
     st.write("อัปโหลดภาพถ่ายด้านหลัง (ท่ายืนตรง) เพื่อประเมินความเสี่ยงเบื้องต้น")
-
     if baseline:
         st.caption(f"✅ ใช้เกณฑ์จากกลุ่มตัวอย่างปกติ ({baseline['n']} คน)")
     else:
         st.caption("⚠️ ยังไม่มีเกณฑ์จากกลุ่มตัวอย่าง — ใช้ค่าเริ่มต้น")
 
-    uploaded_file = st.file_uploader("เลือกภาพถ่าย (ท่ายืนตรง)", type=["jpg", "jpeg", "png"])
-
-    if uploaded_file is not None:
-        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-        image_bgr  = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    uf = st.file_uploader("เลือกภาพถ่าย (ท่ายืนตรง)", type=["jpg","jpeg","png"])
+    if uf:
+        fb  = np.asarray(bytearray(uf.read()),dtype=np.uint8)
+        img = cv2.imdecode(fb, cv2.IMREAD_COLOR)
 
         with st.spinner("กำลังวิเคราะห์..."):
-            result, annotated = analyze_standing(image_bgr)
+            res, ann = analyze_standing(img)
 
-        if result is None:
+        if res is None:
             st.error("ไม่พบร่างกายในภาพ กรุณาลองใหม่")
         else:
+            # Processing steps
             with st.expander("🔍 ดูขั้นตอนการประมวลผล (Processing Steps)", expanded=False):
-                step1, step2, step3, step4, step5 = st.columns(5)
-                with step1:
+                c1,c2,c3,c4,c5 = st.columns(5)
+                with c1:
                     st.caption("1) ภาพต้นฉบับ")
-                    st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
-                with step2:
+                    st.image(cv2.cvtColor(img,cv2.COLOR_BGR2RGB), use_container_width=True)
+                with c2:
                     st.caption("2) ตัดพื้นหลังออกจริง")
-                    st.image(cv2.cvtColor(result["bg_removed"], cv2.COLOR_BGR2RGB), use_container_width=True)
-                with step3:
-                    st.caption("3) ขาวดำ Contrast สูงสุด (ใช้วิเคราะห์ต่อ)")
-                    st.image(cv2.cvtColor(result["contrast_img"], cv2.COLOR_BGR2RGB), use_container_width=True)
-                with step4:
-                    st.caption("4) Person Mask (ขาว = คน, ดำ = พื้นหลัง)")
-                    # สร้างภาพ mask ที่คนเป็นสีขาวล้วน พื้นหลังสีดำล้วน เต็มตัว
-                    mask_vis = np.zeros_like(image_bgr)
-                    mask_vis[result["person_mask"]] = 255
-                    st.image(mask_vis, use_container_width=True)
-                with step5:
+                    st.image(cv2.cvtColor(res["bg_removed"],cv2.COLOR_BGR2RGB), use_container_width=True)
+                with c3:
+                    st.caption("3) ขาวดำ Contrast สูงสุด")
+                    st.image(cv2.cvtColor(res["contrast_img"],cv2.COLOR_BGR2RGB), use_container_width=True)
+                with c4:
+                    st.caption("4) Person Mask (ขาว=คน, ดำ=พื้นหลัง)")
+                    st.image(res["mask_vis"], use_container_width=True)
+                with c5:
                     st.caption("5) จุด Landmark + วิเคราะห์ (ผลลัพธ์สุดท้าย)")
-                    st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
-                st.caption("ขั้นตอน: (1) รับภาพต้นฉบับ → (2) แยกคนออกจากพื้นหลังด้วย Segmentation Mask ของ MediaPipe "
-                           "(โมเดล AI ที่เทรนมาแยกคนโดยเฉพาะ ไม่ใช่การเดาสี) แล้วทาสีพื้นหลังให้เป็นดำล้วนตาม mask "
-                           "โดยไม่เปลี่ยนขนาด/กรอบภาพ → (3) แปลงเป็นขาวดำแล้วยืด contrast เฉพาะบริเวณที่เป็นคนให้เต็มช่วง "
-                           "0-255 ทันทีหลังตัดพื้นหลัง คัดแยกรายละเอียดผิว/เงาให้ชัดขึ้น ได้ภาพนี้ไปใช้วิเคราะห์ Waist/Scapula ต่อ → "
-                           "(4) mask ขาว-ดำที่ใช้ตัดพื้นหลังในขั้นตอนที่ 2-3 (แสดงไว้ให้ตรวจสอบได้) → "
-                           "(5) รวมกับจุด Landmark จาก MediaPipe วิเคราะห์ Spine/Shoulder/Hip ต่อ")
+                    st.image(cv2.cvtColor(ann,cv2.COLOR_BGR2RGB), use_container_width=True)
+                st.caption("ขั้นตอน: (1) รับภาพ → (2) ตัดพื้นหลังด้วย MediaPipe Segmentation Mask → "
+                           "(3) ขาวดำ Contrast สูง → (4) Person Mask ขาว-ดำ → "
+                           "(5) วิเคราะห์จุด Landmark + Waist + Scapula โดยใช้ Landmark เป็น reference ทั้งหมด "
+                           "(ไม่พึ่ง Mask สำหรับการวิเคราะห์ เพื่อความแม่นยำสม่ำเสมอ)")
 
-            annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-            st.image(annotated_rgb,
-                     caption="จุดแดง = ไหล่ (และสะโพกถ้าเห็นในภาพ) | จุดม่วง = เอว (หาจากรูปทรงลำตัว) | เส้นเหลือง = แนวกระดูกสันหลัง (คอ→ไหล่→อก/เอว→สะโพกหรือขอบภาพ) | "
-                             "จุดข้อต่อเขียว/ส้ม/แดง = ระดับการเบี่ยงเบนจากแนวดิ่งของแต่ละข้อ | เส้นประเทา = แนวดิ่งอ้างอิง | "
-                             "กรอบเขียว = Scapula (สะบัก) ด้านที่นูนกว่า — ไม่ใช่ Rib Hump ทางการแพทย์ ต้องวัดจากท่าก้มตัวเท่านั้น",
+            st.image(cv2.cvtColor(ann,cv2.COLOR_BGR2RGB),
+                     caption="จุดแดง=ไหล่/สะโพก | เส้นฟ้า=ไหล่/สะโพก | เส้นเหลือง=แนวกระดูกสันหลัง | จุดม่วง=เอว | จุดเขียว=สะบัก",
                      use_container_width=True)
 
-            if not result["hips_visible"] and not result["waist_detected"]:
-                st.warning("⚠️ ไม่พบทั้งสะโพกและเอวในภาพ — ระบบจะประเมินเฉพาะแนวไหล่และหลังส่วนบนเท่านั้น "
-                           "แนะนำให้ถ่ายภาพให้เห็นตั้งแต่ไหล่ถึงเอวอย่างน้อย เพื่อความแม่นยำที่ดีขึ้น")
-            elif not result["hips_visible"]:
-                st.info("ℹ️ ไม่เห็นสะโพกในภาพ แต่ตรวจพบแนวเอวแทนได้ ระบบจะใช้ Waist Slope ช่วยประเมินความเอียงของลำตัวส่วนล่าง")
+            # Risk
+            bl = baseline
+            def risk(key, lo, hi):
+                v = res.get(key)
+                if v is None: return "—","gray"
+                if bl and bl.get(key) and bl[key]:
+                    return get_risk_level_baseline(v,bl[key]["mean"],bl[key]["sd"])
+                return get_risk_level_default(v,lo,hi)
 
-            if not result["arms_natural"]:
-                sides_text = " และ ".join(result["arm_warn_sides"])
-                st.warning(f"⚠️ ท่าแขนข้าง{sides_text}ดูไม่ห้อยตรงตามธรรมชาติ (อาจยกแขน/กางแขน/เอามือเท้าเอว) "
-                           "อาจทำให้รูปทรงลำตัวที่ใช้วัด Waist/Scapula คลาดเคลื่อนได้ "
-                           "แนะนำให้ถ่ายใหม่โดยปล่อยแขนแนบลำตัวตามธรรมชาติเพื่อความแม่นยำสูงสุด")
+            sh_r,sh_c = risk("shoulder_slope",SLOPE_LOW_UI,SLOPE_HIGH_UI)
+            sp_r,sp_c = risk("spine_dev_ratio",SPINE_DEV_LOW,SPINE_DEV_HIGH)
 
-            if baseline and "spine_dev_ratio" in baseline:
-                shoulder_risk, shoulder_color = get_risk_level_baseline(
-                    result["shoulder_slope"], baseline["shoulder_slope"]["mean"], baseline["shoulder_slope"]["sd"])
-                spine_risk, spine_color = get_risk_level_baseline(
-                    result["spine_dev_ratio"], baseline["spine_dev_ratio"]["mean"], baseline["spine_dev_ratio"]["sd"])
-                if result["hips_visible"] and baseline.get("hip_slope"):
-                    hip_risk, hip_color = get_risk_level_baseline(
-                        result["hip_slope"], baseline["hip_slope"]["mean"], baseline["hip_slope"]["sd"])
-                elif result["hips_visible"]:
-                    hip_risk, hip_color = get_risk_level_default(result["hip_slope"], SLOPE_LOW, SLOPE_HIGH)
-                if result["waist_detected"] and baseline.get("waist_slope"):
-                    waist_risk, waist_color = get_risk_level_baseline(
-                        result["waist_slope"], baseline["waist_slope"]["mean"], baseline["waist_slope"]["sd"])
-                elif result["waist_detected"]:
-                    waist_risk, waist_color = get_risk_level_default(result["waist_slope"], SLOPE_LOW, SLOPE_HIGH)
-                if result["scapula_detected"] and baseline.get("scapula_diff"):
-                    scapula_diff_risk, _ = get_risk_level_baseline(
-                        result["scapula_diff"], baseline["scapula_diff"]["mean"], baseline["scapula_diff"]["sd"])
-                elif result["scapula_detected"]:
-                    scapula_diff_risk, _ = get_risk_level_default(result["scapula_diff"], SCAPULA_DIFF_LOW, SCAPULA_DIFF_HIGH)
-            else:
-                shoulder_risk, shoulder_color = get_risk_level_default(result["shoulder_slope"], SLOPE_LOW, SLOPE_HIGH)
-                spine_risk, spine_color       = get_risk_level_default(result["spine_dev_ratio"], SPINE_DEV_LOW, SPINE_DEV_HIGH)
-                if result["hips_visible"]:
-                    hip_risk, hip_color = get_risk_level_default(result["hip_slope"], SLOPE_LOW, SLOPE_HIGH)
-                if result["waist_detected"]:
-                    waist_risk, waist_color = get_risk_level_default(result["waist_slope"], SLOPE_LOW, SLOPE_HIGH)
-                if result["scapula_detected"]:
-                    scapula_diff_risk, _ = get_risk_level_default(result["scapula_diff"], SCAPULA_DIFF_LOW, SCAPULA_DIFF_HIGH)
-
-            if result["scapula_detected"]:
-                # Scapula มี 2 สัญญาณ (ความนูน + ตำแหน่งสูง-ต่ำ) เอาตัวที่เสี่ยงกว่ามาเป็นตัวแทน
-                scapula_height_risk, _ = get_risk_level_default(result["scapula_height_ratio"], SCAPULA_HEIGHT_LOW, SCAPULA_HEIGHT_HIGH)
-                scapula_risk = max([scapula_diff_risk, scapula_height_risk],
-                                    key=lambda r: ["ต่ำ (ปกติ)", "ปานกลาง", "สูง"].index(r))
-                scapula_color = {"ต่ำ (ปกติ)": "green", "ปานกลาง": "orange", "สูง": "red"}[scapula_risk]
-
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Shoulder Slope", f"{result['shoulder_slope']:.4f}")
-                st.markdown(f"ความเสี่ยง: :{shoulder_color}[{shoulder_risk}]")
-            with col2:
-                if result["hips_visible"]:
-                    st.metric("Hip Slope", f"{result['hip_slope']:.4f}")
-                    st.markdown(f"ความเสี่ยง: :{hip_color}[{hip_risk}]")
+            c1,c2,c3 = st.columns(3)
+            with c1:
+                st.metric("Shoulder Slope",f"{res['shoulder_slope']:.4f}")
+                st.markdown(f"ความเสี่ยง: :{sh_c}[{sh_r}]")
+            with c2:
+                if res["hips_visible"]:
+                    hr,hc = risk("hip_slope",SLOPE_LOW_UI,SLOPE_HIGH_UI)
+                    st.metric("Hip Slope",f"{res['hip_slope']:.4f}")
+                    st.markdown(f"ความเสี่ยง: :{hc}[{hr}]")
                 else:
-                    st.metric("Hip Slope", "—")
+                    st.metric("Hip Slope","—")
                     st.markdown("ไม่พบสะโพกในภาพ")
-            with col3:
-                if result["trunk_tilt_angle"] is not None:
-                    st.metric("Trunk Tilt Angle", f"{result['trunk_tilt_angle']:.2f}°")
-                else:
-                    st.metric("Trunk Tilt Angle", "—")
+            with c3:
+                tt = res["trunk_tilt_angle"]
+                st.metric("Trunk Tilt Angle", f"{tt:.2f}°" if tt else "—")
 
-            col6 = st.columns(1)[0]
-            with col6:
-                st.metric("Spine Deviation", f"{result['spine_dev_ratio']:.4f}")
-                st.markdown(f"ความเสี่ยง: :{spine_color}[{spine_risk}] (เบี่ยง{result['spine_dev_dir']})")
+            st.metric("Spine Deviation",f"{res['spine_dev_ratio']:.4f}")
+            st.markdown(f"ความเสี่ยง: :{sp_c}[{sp_r}] (เบี่ยง{res['spine_dev_dir']})")
 
-            col7, col8 = st.columns(2)
-            with col7:
-                if result["waist_detected"]:
-                    st.metric("Waist Slope", f"{result['waist_slope']:.4f}")
-                    st.markdown(f"ความเสี่ยง: :{waist_color}[{waist_risk}]")
+            cw,cs = st.columns(2)
+            with cw:
+                if res["waist_detected"]:
+                    wr,wc = risk("waist_slope",SLOPE_LOW_UI,SLOPE_HIGH_UI)
+                    st.metric("Waist Slope",f"{res['waist_slope']:.4f}")
+                    st.markdown(f"ความเสี่ยง: :{wc}[{wr}]")
                 else:
-                    st.metric("Waist Slope", "—")
+                    st.metric("Waist Slope","—")
                     st.markdown("ไม่พบแนวเอวในภาพ")
-            with col8:
-                if result["scapula_detected"]:
-                    st.metric("Scapula Prominence", f"{result['scapula_diff']:.1f}")
-                    st.markdown(f"ความเสี่ยง: :{scapula_color}[{scapula_risk}]")
-                    st.write(f"**สะบักด้านที่นูนกว่า:** {result['scapula_side']}")
-                    if result["scapula_higher_side"] != "-":
-                        st.caption(f"สะบักด้านที่อยู่สูงกว่า: {result['scapula_higher_side']} "
-                                   f"(ต่างกัน {result['scapula_height_ratio']*100:.1f}% ของช่วงที่วัด)")
+            with cs:
+                if res["scapula_detected"]:
+                    scr,scc = risk("scapula_diff",SCAPULA_DIFF_LOW,SCAPULA_DIFF_HIGH)
+                    st.metric("Scapula Prominence",f"{res['scapula_diff']:.1f}")
+                    st.markdown(f"ความเสี่ยง: :{scc}[{scr}]")
+                    st.write(f"สะบักด้านที่นูนกว่า: **{res['scapula_side']}**")
                 else:
-                    st.metric("Scapula Prominence", "—")
-                    st.markdown("ไม่พบสะบักที่ชัดเจนพอในภาพ (ไม่นำไปคิดความเสี่ยง)")
+                    st.metric("Scapula Prominence","—")
+                    st.markdown("ไม่พบสะบักที่ชัดเจนพอ")
 
-            if not result["hips_visible"]:
-                curve_note = "ไม่เห็นสะโพกในภาพ จึงยังไม่สามารถบอกลักษณะการบิดของลำตัวทั้งท่อนได้"
-            elif result["same_direction"]:
-                curve_note = "ไหล่และสะโพกเอียงไปทาง**เดียวกัน** → ลำตัวเอียงไปทั้งแท่ง (C-curve)"
-            elif result["shoulder_tilt_dir"] == "level" or result["hip_tilt_dir"] == "level":
-                curve_note = "ไม่พบการเอียงที่ชัดเจน"
+            # curve type
+            if not res["hips_visible"]:
+                cnote = "ไม่เห็นสะโพกในภาพ ยังไม่สามารถบอกลักษณะการบิดของลำตัวทั้งท่อนได้"
+            elif res["same_direction"]:
+                cnote = "ไหล่และสะโพกเอียงไปทาง**เดียวกัน** → ลำตัวเอียงทั้งแท่ง (C-curve)"
+            elif res["shoulder_tilt_dir"]=="level" or res["hip_tilt_dir"]=="level":
+                cnote = "ไม่พบการเอียงที่ชัดเจน"
             else:
-                curve_note = "ไหล่และสะโพกเอียง**คนละทาง** → อาจมีการบิดของลำตัวสองช่วง (เข้าข่าย S-curve เบื้องต้น)"
+                cnote = "ไหล่และสะโพกเอียง**คนละทาง** → อาจมีการบิดของลำตัวสองช่วง (เข้าข่าย S-curve เบื้องต้น)"
+            st.write(f"**ลักษณะแนวลำตัว:** {cnote}")
 
-            st.write(f"**ลักษณะแนวลำตัว:** {curve_note}")
+            # Overall risk
+            risk_pool = [sh_r, sp_r]
+            if res["hips_visible"]: risk_pool.append(hr)
+            if res["waist_detected"]: risk_pool.append(wr)
+            if res["scapula_detected"]: risk_pool.append(scr)
+            valid = [r for r in risk_pool if r != "—"]
+            overall = max(valid, key=lambda r: ["ต่ำ (ปกติ)","ปานกลาง","สูง"].index(r)) if valid else "ต่ำ (ปกติ)"
+            if res["hips_visible"] and not res["same_direction"] and res["shoulder_tilt_dir"]!="level" and res["hip_tilt_dir"]!="level":
+                if overall=="ต่ำ (ปกติ)": overall="ปานกลาง"
 
-            if result["waist_detected"]:
-                waist_dir_label = {"right_up": "เอียงขึ้นทางขวา", "left_up": "เอียงขึ้นทางซ้าย", "level": "ไม่เอียงชัดเจน"}.get(result["waist_tilt_dir"], "-")
-                st.caption(f"แนวเอว: {waist_dir_label} (Waist Slope {result['waist_slope']:.4f})")
-
-            risk_pool = [shoulder_risk, spine_risk]
-            if result["scapula_detected"]:
-                risk_pool.append(scapula_risk)
-            if result["hips_visible"]:
-                risk_pool.append(hip_risk)
-            if result["waist_detected"]:
-                risk_pool.append(waist_risk)
-            overall_risk = max(risk_pool, key=lambda r: ["ต่ำ (ปกติ)", "ปานกลาง", "สูง"].index(r))
-
-            if result["hips_visible"] and not result["same_direction"] and result["shoulder_tilt_dir"] != "level" and result["hip_tilt_dir"] != "level":
-                if overall_risk == "ต่ำ (ปกติ)":
-                    overall_risk = "ปานกลาง"
-
-            st.subheader(f"ผลการประเมิน: {overall_risk}")
-            st.info(RECOMMENDATIONS[overall_risk])
+            st.subheader(f"ผลการประเมิน: {overall}")
+            st.info(RECOMMENDATIONS[overall])
             st.caption("⚠️ ระบบนี้เป็นเครื่องมือคัดกรองเบื้องต้นเท่านั้น ไม่สามารถใช้แทนการวินิจฉัยทางการแพทย์ได้")
