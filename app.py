@@ -484,11 +484,18 @@ def analyze_standing(image_bgr):
         # (ไม่ใช้ heuristic เดาสีพื้นหลัง เพราะเดาผิดทำให้ฝั่งใดฝั่งหนึ่งกลายเป็นสีดำ)
         person_mask = np.ones((h, w), dtype=bool)
 
-    # ขยาย mask ออกก่อนเพื่อให้ครอบคลุมขอบร่างกายได้สมบูรณ์ขึ้น
-    # (segmentation mask ของ MediaPipe บางครั้งครอบคลุมไม่ถึงขอบจริง ทำให้พื้นหลังขอบๆ หลุดเข้ามา)
-        kernel_dilate = np.ones((30, 30), np.uint8)
+    # ขยาย mask และเติมรูโหว่ให้ครอบคลุมร่างกายสมบูรณ์ขึ้น
     person_mask_u8 = person_mask.astype(np.uint8) * 255
+    kernel_dilate = np.ones((25, 25), np.uint8)
     person_mask_u8 = cv2.dilate(person_mask_u8, kernel_dilate, iterations=3)
+    # Flood fill เติมรูโหว่ภายใน: flood จากมุม (0,0) ด้วยสี 128
+    # พื้นที่ที่ flood ไปถึง = พื้นหลังแน่นอน, ไปไม่ถึง = รูโหว่ภายในคน
+    ff = person_mask_u8.copy()
+    ff_flood = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(ff, ff_flood, (0, 0), 128)
+    interior_holes = (ff == 0)  # พื้นที่ที่ flood ไม่ถึงและไม่ใช่ mask เดิม = รูโหว่
+    person_mask_u8[interior_holes] = 255
+    person_mask = person_mask_u8 > 0
 
     # ลบส่วนที่ mask อาจเชื่อมติดกันผิดพลาด (เช่น ช่องว่างใต้รักแร้ระหว่างแขน-ลำตัว)
     # ด้วย erosion เบาๆ ก่อนนำไปใช้งานต่อ
